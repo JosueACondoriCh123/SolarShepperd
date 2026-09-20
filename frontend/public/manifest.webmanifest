@@ -1,0 +1,12 @@
+{
+  "name": "SolarShepherd Field Console",
+  "short_name": "SolarShepherd",
+  "start_url": "/telemetry",
+  "display": "standalone",
+  "background_color": "#f2ead5",
+  "theme_color": "#ffc857",
+  "description": "Evidence-first climate and pastoral field console for the JKUAT pilot.",
+  "icons": [
+    { "src": "/solarshepherd-icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

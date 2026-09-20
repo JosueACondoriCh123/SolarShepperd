@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "solarshepherd-backend"
+version = "0.1.0"
+description = "SolarShepherd scientific geospatial API and workers"
+requires-python = ">=3.11"
+dependencies = [
+  "alembic>=1.16,<2",
+  "asyncpg>=0.30,<1",
+  "celery[redis]>=5.5,<6",
+  "fastapi>=0.116,<1",
+  "geoalchemy2>=0.18,<1",
+  "h3>=4.3,<5",
+  "httpx>=0.28,<1",
+  "numpy>=2.0,<3",
+  "orjson>=3.10,<4",
+  "Pillow>=11,<13",
+  "planetary-computer>=1.0,<2",
+  "psycopg[binary]>=3.2,<4",
+  "PyJWT[crypto]>=2.10,<3",
+  "pydantic-settings>=2.10,<3",
+  "pyproj>=3.7,<4",
+  "pystac-client>=0.9,<1",
+  "python-dateutil>=2.9,<3",
+  "python-multipart>=0.0.20,<1",
+  "rasterio>=1.4,<2",
+  "rasterstats>=0.20,<1",
+  "reportlab>=4.4,<5",
+  "redis>=6,<7",
+  "shapely>=2.1,<3",
+  "sqlalchemy>=2.0.40,<3",
+  "structlog>=25,<26",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "anyio>=4.9,<5",
+  "httpx>=0.28,<1",
+  "pytest>=8.4,<9",
+  "pytest-asyncio>=1.0,<2",
+  "ruff>=0.12,<1",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["B008"]
