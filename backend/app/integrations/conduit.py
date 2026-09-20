@@ -31,11 +31,20 @@ UNITS = {
     "temperature_c": "°C",
     "soil_moisture_surface_pct": "%",
     "soil_moisture_deep_pct": "%",
-    "uv_index": "index",
     "precipitation_mm": "mm",
+    "precipitation_increment_mm": "mm",
+    "precipitation_prior_day_mm": "mm",
     "solar_radiation_w_m2": "W/m²",
     "relative_humidity_pct": "%",
+    "pressure_hpa": "hPa",
     "wind_speed_m_s": "m/s",
+    "wind_direction_deg": "deg",
+    "wind_gust_m_s": "m/s",
+    "heat_index_c": "°C",
+    "wet_bulb_temperature_c": "°C",
+    "wet_bulb_globe_temperature_c": "°C",
+    "visible_light_count": "count",
+    "infrared_light_count": "count",
 }
 
 

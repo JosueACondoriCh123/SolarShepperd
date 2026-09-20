@@ -231,6 +231,7 @@ async def telemetry(
     to_time: datetime | None = Query(default=None, alias="to"),
     metric: str | None = None,
     station_id: str | None = None,
+    bucket_minutes: int = Query(default=1, ge=1, le=1_440),
     pilot: str = Query(default="jkuat"),
 ) -> TelemetryResponse:
     pilot_definition = _require_pilot(pilot)
@@ -246,15 +247,44 @@ async def telemetry(
         raise APIError(
             "TIME_RANGE_TOO_LARGE", "Telemetry queries are limited to 90 days.", status_code=422
         )
-    statement = select(TelemetryObservation).where(
+    conditions = [
         TelemetryObservation.pilot_slug == pilot_definition.slug,
         TelemetryObservation.observed_at >= start,
         TelemetryObservation.observed_at <= end,
-    )
+    ]
     if metric:
-        statement = statement.where(TelemetryObservation.metric == metric)
+        conditions.append(TelemetryObservation.metric == metric)
     if station_id:
-        statement = statement.where(TelemetryObservation.station_id == station_id)
+        conditions.append(TelemetryObservation.station_id == station_id)
+    if bucket_minutes == 1:
+        statement = select(TelemetryObservation).where(*conditions)
+    else:
+        bucket_index = func.floor(
+            func.extract("epoch", TelemetryObservation.observed_at) / (bucket_minutes * 60)
+        )
+        ranked = (
+            select(
+                TelemetryObservation.id.label("observation_id"),
+                func.row_number()
+                .over(
+                    partition_by=(
+                        TelemetryObservation.metric,
+                        TelemetryObservation.station_id,
+                        TelemetryObservation.depth_cm,
+                        bucket_index,
+                    ),
+                    order_by=TelemetryObservation.observed_at.desc(),
+                )
+                .label("bucket_rank"),
+            )
+            .where(*conditions)
+            .subquery()
+        )
+        statement = (
+            select(TelemetryObservation)
+            .join(ranked, ranked.c.observation_id == TelemetryObservation.id)
+            .where(ranked.c.bucket_rank == 1)
+        )
     rows = (
         await session.execute(
             statement.order_by(TelemetryObservation.observed_at.asc()).limit(20_000)
@@ -267,7 +297,10 @@ async def telemetry(
             unit=row.unit,
             observed_at=row.observed_at,
             source=row.source,
-            quality_flags=row.quality_flags,
+            quality_flags=[
+                *row.quality_flags,
+                *(["DOWNSAMPLED_LATEST_IN_BUCKET"] if bucket_minutes > 1 else []),
+            ],
             model_version=row.model_version,
             station_id=row.station_id,
             depth_cm=row.depth_cm,

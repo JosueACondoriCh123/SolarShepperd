@@ -21,3 +21,12 @@ def test_normalization_uses_canonical_units() -> None:
     assert records[0]["value"] == 24.5
     assert records[0]["unit"] == "°C"
     assert records[0]["metric"] == "temperature_c"
+
+
+def test_raw_uv_count_is_not_accepted_as_observed_uv_index() -> None:
+    payload = [{"ts": "2026-09-01T10:00:00Z", "su1": 4.9}]
+    assert normalize_records(
+        payload,
+        {"observed_at": "ts", "uv_index": "su1"},
+        "jkuat-conduit",
+    ) == []

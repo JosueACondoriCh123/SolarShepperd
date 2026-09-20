@@ -54,12 +54,14 @@ paths shown in Operations. Example:
 
 ```json
 {
-  "observed_at": "timestamp",
-  "temperature_c": "temperature",
-  "soil_moisture_surface_pct": "soil_moisture_10cm",
-  "soil_moisture_deep_pct": "soil_moisture_30cm",
-  "uv_index": "uv_index",
-  "precipitation_mm": "rainfall"
+  "observed_at": "ts",
+  "temperature_c": "st1",
+  "relative_humidity_pct": "sh1",
+  "pressure_hpa": "bp1",
+  "precipitation_mm": "rgt",
+  "wind_speed_m_s": "ws",
+  "wind_direction_deg": "wd",
+  "wind_gust_m_s": "wg"
 }
 ```
 
@@ -74,6 +76,20 @@ Supported sources are `conduit`, `aviation_weather`, `forecast`, `satellite`,
 `terrain`, and `osm`. Conduit remains specific to JKUAT; Garissa and Lodwar use
 public METAR observations with exact station provenance and no invented local
 station values.
+
+Historical JKUAT FEWSNET GeoCSV exports can be loaded without enabling a live
+Conduit credential:
+
+```bash
+docker cp jkuat.csv solarshepherd-api-1:/tmp/jkuat.csv
+docker compose exec api python -m app.cli import-geocsv /tmp/jkuat.csv
+```
+
+The importer verifies the JKUAT site coordinates, stores the file checksum and
+metadata, and upserts observations idempotently. It intentionally excludes
+battery voltage, the undecoded health bitfield, the unconfirmed second rain
+gauge, raw SI1145 UV counts and the defective gust-direction export. Observed
+ET₀ remains unavailable until explicit daily Tmin/Tmax inputs are supplied.
 
 Open-Meteo forecasts are stored independently from Conduit observations and are
 labelled `FORECAST_NOT_OBSERVATION`. The worker refreshes the 72-hour outlook

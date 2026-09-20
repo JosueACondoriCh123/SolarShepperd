@@ -1,5 +1,6 @@
 import {
   CloudRain,
+  Compass,
   Droplets,
   Gauge,
   RefreshCw,
@@ -22,9 +23,15 @@ import type { ForecastPoint, ForecastResponse, Measurement, TelemetryResponse } 
 const metricCatalog = [
   { key: "temperature_c", forecastKey: "temperature_c", label: "Air temperature", unit: "°C", icon: ThermometerSun, color: "#d95d39", accent: "amber" as const },
   { key: "relative_humidity_pct", forecastKey: "relative_humidity_pct", label: "Relative humidity", unit: "%", icon: Droplets, color: "#3478b8", accent: "blue" as const },
+  { key: "pressure_hpa", label: "Station pressure", unit: "hPa", icon: Gauge, color: "#6d5b44", accent: "amber" as const },
   { key: "uv_index", forecastKey: "uv_index", label: "UV index", unit: "index", icon: Sun, color: "#c07b00", accent: "amber" as const },
   { key: "wind_speed_m_s", forecastKey: "wind_speed_m_s", label: "Wind speed", unit: "m/s", icon: Wind, color: "#5e4fa2", accent: "violet" as const },
-  { key: "precipitation_mm", forecastKey: "precipitation_mm", label: "Precipitation", unit: "mm", icon: CloudRain, color: "#2469a0", accent: "blue" as const },
+  { key: "wind_direction_deg", label: "Wind direction", unit: "deg", icon: Compass, color: "#76528f", accent: "violet" as const },
+  { key: "wind_gust_m_s", forecastKey: "wind_gust_m_s", label: "Wind gust", unit: "m/s", icon: Wind, color: "#8a4f7d", accent: "violet" as const },
+  { key: "precipitation_mm", forecastKey: "precipitation_mm", label: "Rainfall", unit: "mm", icon: CloudRain, color: "#2469a0", accent: "blue" as const },
+  { key: "heat_index_c", label: "Heat index", unit: "°C", icon: ThermometerSun, color: "#bd563a", accent: "amber" as const },
+  { key: "wet_bulb_temperature_c", label: "Wet-bulb temperature", unit: "°C", icon: Droplets, color: "#23839a", accent: "blue" as const },
+  { key: "wet_bulb_globe_temperature_c", label: "Wet-bulb globe temperature", unit: "°C", icon: ThermometerSun, color: "#86712e", accent: "green" as const },
   { key: "et0_mm_day", forecastKey: "et0_mm", label: "Reference ET₀", unit: "mm", icon: Gauge, color: "#23845c", accent: "green" as const },
   { key: "soil_moisture_surface_pct", label: "Surface moisture", unit: "%", icon: Droplets, color: "#168f6d", accent: "blue" as const },
   { key: "soil_moisture_deep_pct", label: "Deep moisture", unit: "%", icon: Waves, color: "#6746a5", accent: "violet" as const },
@@ -40,13 +47,14 @@ function forecastValue(point: ForecastPoint, key: string): number | null {
 }
 
 export function TelemetryPage() {
-  const [rangeHours, setRangeHours] = useState(24);
+  const [rangeHours, setRangeHours] = useState(720);
   const [mode, setMode] = useState<"observed" | "forecast">("observed");
   const [chartMetric, setChartMetric] = useState("temperature_c");
   const from = useMemo(() => new Date(Date.now() - rangeHours * 3_600_000).toISOString(), [rangeHours]);
+  const bucketMinutes = rangeHours <= 24 ? 5 : rangeHours <= 168 ? 30 : 120;
   const observed = useApi<TelemetryResponse>(
-    () => apiGet(`/telemetry?from=${encodeURIComponent(from)}`),
-    [from],
+    () => apiGet(`/telemetry?from=${encodeURIComponent(from)}&bucket_minutes=${bucketMinutes}`),
+    [from, bucketMinutes],
     60_000,
   );
   const forecast = useApi<ForecastResponse>(() => apiGet("/forecast?hours=72"), [], 180_000);
@@ -120,7 +128,7 @@ export function TelemetryPage() {
       <div className="context-strip">
         {mode === "observed" ? (
           <>
-            <div><span className={isFresh ? "signal-dot" : "signal-dot muted"} /><strong>Conduit@Empathy</strong></div>
+            <div><span className={isFresh ? "signal-dot" : "signal-dot muted"} /><strong>JKUAT FEWSNET · Conduit@Empathy</strong></div>
             <span>{latestTimestamp ? `Latest observation ${new Date(latestTimestamp).toLocaleString()}` : "No normalized observation received"}</span>
             <StatusBadge status={measurements.length ? (isFresh ? "live" : "delayed") : "awaiting data"} />
           </>

@@ -64,10 +64,10 @@ PILOTS: tuple[PilotDefinition, ...] = (
         stations=(
             ObservationStation(
                 station_id="jkuat-conduit",
-                name="JKUAT configured field station",
-                latitude=-1.1018,
-                longitude=37.0144,
-                source="Conduit",
+                name="Kenya Kiambu JKUAT IoT AWS · Conduit@Empathy1",
+                latitude=-1.099736,
+                longitude=37.014528,
+                source="FEWSNET GeoCSV / Conduit",
             ),
             ObservationStation(
                 station_id="HKJK",

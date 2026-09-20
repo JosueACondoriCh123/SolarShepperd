@@ -3,20 +3,19 @@ from __future__ import annotations
 import asyncio
 import time
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from uuid import UUID
-from zoneinfo import ZoneInfo
 
 import h3
 import structlog
 from geoalchemy2.shape import from_shape
 from shapely.geometry import MultiPolygon, Point, Polygon, shape
-from sqlalchemy import select, text, update
+from sqlalchemy import delete, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.domain.et0 import ET0_MODEL_VERSION, hargreaves_samani_et0
 from app.domain.indices import SPECTRAL_MODEL_VERSION
 from app.integrations.aviation_weather import (
     AviationWeatherClient,
@@ -24,6 +23,7 @@ from app.integrations.aviation_weather import (
 )
 from app.integrations.conduit import ConduitClient, normalize_records
 from app.integrations.geo import geodesic_buffer, h3_cells_for_polygon, h3_centroid, h3_polygon
+from app.integrations.geocsv import EXCLUDED_FIELDS, VERIFIED_FIELDS, parse_geocsv
 from app.integrations.open_meteo import (
     FORECAST_MODEL_VERSION,
     OpenMeteoClient,
@@ -196,21 +196,21 @@ class IngestionService:
                 )
                 await self.session.execute(statement)
                 written += 1
-            et0_written = await self._derive_et0(records, raw_payload_id)
             await self.session.commit()
             mapping_required = not bool(self.settings.conduit_field_map)
             return await self._finish_run(
                 run,
                 status="mapping_required" if mapping_required else "success",
                 records_seen=len(records),
-                records_written=written + et0_written,
+                records_written=written,
                 latency_ms=fetched.latency_ms,
                 discovered_fields=fetched.discovered_fields,
                 diagnostics={
                     "pilot_slug": self.pilot_slug,
                     "checksum": fetched.checksum,
                     "mapping_configured": not mapping_required,
-                    "et0_records_written": et0_written,
+                    "et0_status": "INSUFFICIENT_DATA",
+                    "et0_reason": "EXPLICIT_DAILY_TMIN_TMAX_REQUIRED",
                 },
             )
         except Exception as exc:
@@ -222,6 +222,136 @@ class IngestionService:
                 run_id,
                 error_code="CONDUIT_INGESTION_FAILED",
                 error_message=_safe_error_message(exc),
+            )
+
+    async def remove_unverified_jkuat_observations(self) -> int:
+        if self.pilot_slug != "jkuat":
+            return 0
+        result = await self.session.execute(
+            delete(TelemetryObservation).where(
+                TelemetryObservation.pilot_slug == self.pilot_slug,
+                TelemetryObservation.station_id == self.settings.conduit_station_id,
+                TelemetryObservation.metric.in_(
+                    [
+                        "battery_voltage_v",
+                        "et0_mm_day",
+                        "health_status",
+                        "precipitation_gauge_2_mm",
+                        "uv_index",
+                        "wind_gust_direction_deg",
+                    ]
+                ),
+            )
+        )
+        await self.session.commit()
+        return int(result.rowcount or 0)
+
+    async def ingest_geocsv(self, path: Path) -> IngestionRun:
+        if self.pilot_slug != "jkuat":
+            raise ValueError("FEWSNET GeoCSV ingestion is only configured for JKUAT")
+        started = time.perf_counter()
+        run = await self._start_run("conduit")
+        run_id = run.id
+        try:
+            parsed = parse_geocsv(path, self.settings.conduit_station_id)
+            if parsed.metadata.get("data collection site", "").strip().lower() != "site jkuat":
+                raise ValueError("GeoCSV does not identify the JKUAT collection site")
+            if not self.area.covers(Point(parsed.longitude, parsed.latitude)):
+                raise ValueError("GeoCSV station coordinates fall outside the JKUAT pilot")
+
+            run.requested_from = parsed.first_observed_at.date()
+            run.requested_to = parsed.last_observed_at.date()
+            raw_payload_id = (
+                await self.session.execute(
+                    select(RawSourcePayload.id).where(
+                        RawSourcePayload.checksum == parsed.checksum
+                    )
+                )
+            ).scalar_one_or_none()
+            idempotent_replay = raw_payload_id is not None
+            if raw_payload_id is None:
+                raw_payload = RawSourcePayload(
+                    pilot_slug=self.pilot_slug,
+                    source="fewsnet_geocsv",
+                    requested_from=parsed.first_observed_at.date(),
+                    requested_to=parsed.last_observed_at.date(),
+                    checksum=parsed.checksum,
+                    payload={
+                        "filename": parsed.filename,
+                        "metadata": parsed.metadata,
+                        "rows_seen": parsed.rows_seen,
+                        "normalized_record_count": len(parsed.records),
+                        "excluded_fields": EXCLUDED_FIELDS,
+                    },
+                )
+                self.session.add(raw_payload)
+                await self.session.flush()
+                raw_payload_id = raw_payload.id
+
+            records_written = 0
+            batch_size = 1_000
+            for offset in range(0, len(parsed.records), batch_size):
+                batch = [
+                    {
+                        **record,
+                        "pilot_slug": self.pilot_slug,
+                        "raw_payload_id": raw_payload_id,
+                    }
+                    for record in parsed.records[offset : offset + batch_size]
+                ]
+                statement = insert(TelemetryObservation).values(batch)
+                statement = statement.on_conflict_do_update(
+                    constraint="uq_telemetry_identity",
+                    set_={
+                        "pilot_slug": statement.excluded.pilot_slug,
+                        "value": statement.excluded.value,
+                        "unit": statement.excluded.unit,
+                        "source": statement.excluded.source,
+                        "quality_flags": statement.excluded.quality_flags,
+                        "model_version": statement.excluded.model_version,
+                        "raw_payload_id": statement.excluded.raw_payload_id,
+                        "updated_at": datetime.now(UTC),
+                    },
+                )
+                await self.session.execute(statement)
+                records_written += len(batch)
+            await self.session.commit()
+            return await self._finish_run(
+                run,
+                status="success",
+                records_seen=parsed.rows_seen,
+                records_written=records_written,
+                latency_ms=round((time.perf_counter() - started) * 1_000),
+                discovered_fields=sorted(
+                    {source for source, _unit in VERIFIED_FIELDS.values()}
+                ),
+                diagnostics={
+                    "input_format": "GeoCSV 2.0",
+                    "filename": parsed.filename,
+                    "checksum": parsed.checksum,
+                    "idempotent_replay": idempotent_replay,
+                    "station_id": self.settings.conduit_station_id,
+                    "first_observed_at": parsed.first_observed_at.isoformat(),
+                    "last_observed_at": parsed.last_observed_at.isoformat(),
+                    "duplicate_timestamps": parsed.duplicate_timestamps,
+                    "invalid_values_skipped": parsed.invalid_values_skipped,
+                    "excluded_fields": EXCLUDED_FIELDS,
+                    "et0_status": "INSUFFICIENT_DATA",
+                },
+            )
+        except Exception as exc:
+            await self.session.rollback()
+            logger.exception(
+                "geocsv_ingestion_failed",
+                run_id=str(run_id),
+                filename=path.name,
+                error_type=type(exc).__name__,
+            )
+            return await self._fail_run(
+                run_id,
+                error_code="GEOCSV_INGESTION_FAILED",
+                error_message=_safe_error_message(exc),
+                latency_ms=round((time.perf_counter() - started) * 1_000),
             )
 
     async def ingest_forecast(self) -> IngestionRun:
@@ -324,53 +454,6 @@ class IngestionService:
                 error_code="FORECAST_INGESTION_FAILED",
                 error_message=_safe_error_message(exc),
             )
-
-    async def _derive_et0(self, records: list[dict[str, Any]], raw_payload_id: Any) -> int:
-        timezone = ZoneInfo(self.pilot.timezone)
-        temperatures: dict[date, list[float]] = {}
-        for record in records:
-            if record["metric"] != "temperature_c":
-                continue
-            local_date = record["observed_at"].astimezone(timezone).date()
-            temperatures.setdefault(local_date, []).append(record["value"])
-        written = 0
-        for local_date, values in temperatures.items():
-            if len(values) < 2:
-                continue
-            result = hargreaves_samani_et0(
-                min(values), max(values), self.pilot.latitude, local_date
-            )
-            local_midnight = datetime.combine(local_date, datetime.min.time(), tzinfo=timezone)
-            observed_at = local_midnight.astimezone(UTC)
-            statement = (
-                insert(TelemetryObservation)
-                .values(
-                    pilot_slug=self.pilot_slug,
-                    station_id=self.settings.conduit_station_id,
-                    observed_at=observed_at,
-                    metric="et0_mm_day",
-                    depth_cm=None,
-                    value=result.value_mm_day,
-                    unit="mm/day",
-                    source="derived",
-                    quality_flags=["DAILY_DERIVED_FROM_MIN_MAX_TEMPERATURE"],
-                    model_version=ET0_MODEL_VERSION,
-                    raw_payload_id=raw_payload_id,
-                )
-                .on_conflict_do_update(
-                    constraint="uq_telemetry_identity",
-                    set_={
-                        "value": result.value_mm_day,
-                        "quality_flags": ["DAILY_DERIVED_FROM_MIN_MAX_TEMPERATURE"],
-                        "model_version": ET0_MODEL_VERSION,
-                        "raw_payload_id": raw_payload_id,
-                        "updated_at": datetime.now(UTC),
-                    },
-                )
-            )
-            await self.session.execute(statement)
-            written += 1
-        return written
 
     async def ingest_public_observations(self, hours: int = 24) -> IngestionRun:
         run = await self._start_run("aviation_weather")
