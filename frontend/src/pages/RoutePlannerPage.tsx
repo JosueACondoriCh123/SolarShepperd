@@ -1,5 +1,6 @@
-import { Clock3, Download, FileJson, Flag, MapPin, Navigation, Route as RouteIcon, Save, SlidersHorizontal } from "lucide-react";
+import { CheckCircle2, Clock3, Download, FileJson, Flag, MapPin, Navigation, Route as RouteIcon, Save, ShieldAlert, SlidersHorizontal } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 
 import { ApiError, apiDownload, apiGet, apiPost } from "../api";
 import { useAuth } from "../auth/AuthContext";
@@ -17,6 +18,11 @@ type Coordinate = { latitude: number; longitude: number };
 export function RoutePlannerPage() {
   const auth = useAuth();
   const { pilot } = usePilot();
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
+  const responseCaseId = searchParams.get("response");
+  const [attaching, setAttaching] = useState(false);
+  const [attachError, setAttachError] = useState("");
   const bbox = pilot.bbox.join(",");
   const [start, setStart] = useState<Coordinate>({
     latitude: pilot.center.latitude,
@@ -105,14 +111,84 @@ export function RoutePlannerPage() {
     if (route) window.location.assign(`/app/${pilot.slug}/missions?route=${route.id}`);
   };
 
+  const attachToResponse = async () => {
+    if (!route || !responseCaseId) return;
+    setAttaching(true);
+    setAttachError("");
+    try {
+      const caseDetail = await apiGet<{ revision: number }>(`/response-cases/${responseCaseId}`);
+      await apiPost(`/response-cases/${responseCaseId}/route`, {
+        route_id: route.id,
+        revision: caseDetail.revision,
+      });
+      navigate(`/app/${pilot.slug}/responses/${responseCaseId}`);
+    } catch (err) {
+      setAttachError(err instanceof Error ? err.message : "Failed to attach route to response episode.");
+    } finally {
+      setAttaching(false);
+    }
+  };
+
   return (
     <div className="page map-page">
       <PageHeader
         kicker="03 / Movement intelligence"
         title="Route planner"
         description="A* travel-time routes across real terrain with bounded UV, forage and water adjustments."
-        actions={route && !auth.isGuest && <div className="page-actions"><button className="button secondary" onClick={openMission}><Save size={16} /> Use in mission</button><button className="button secondary" onClick={() => void apiDownload(`/routes/${route.id}/evidence`, `solarshepherd-${route.id}-evidence.json`)}><FileJson size={16} /> Evidence</button><button className="button secondary" onClick={() => void apiDownload(`/routes/${route.id}/gpx`, `solarshepherd-${route.id}.gpx`)}><Download size={16} /> GPX</button></div>}
+        actions={
+          route &&
+          !auth.isGuest && (
+            <div className="page-actions">
+              {responseCaseId ? (
+                <button
+                  className="button primary"
+                  disabled={attaching}
+                  onClick={() => void attachToResponse()}
+                >
+                  <CheckCircle2 size={16} /> {attaching ? "Attaching..." : "Attach to Response Episode"}
+                </button>
+              ) : (
+                <button className="button secondary" onClick={openMission}>
+                  <Save size={16} /> Use in mission
+                </button>
+              )}
+              <button
+                className="button secondary"
+                onClick={() =>
+                  void apiDownload(
+                    `/routes/${route.id}/evidence`,
+                    `solarshepherd-${route.id}-evidence.json`,
+                  )
+                }
+              >
+                <FileJson size={16} /> Evidence
+              </button>
+              <button
+                className="button secondary"
+                onClick={() =>
+                  void apiDownload(`/routes/${route.id}/gpx`, `solarshepherd-${route.id}.gpx`)
+                }
+              >
+                <Download size={16} /> GPX
+              </button>
+            </div>
+          )
+        }
       />
+
+      {responseCaseId && (
+        <div className="panel response-context-banner">
+          <ShieldAlert size={18} />
+          <div>
+            <strong>Response Episode {responseCaseId.slice(0, 8)}... Active</strong>
+            <p>
+              Plan and verify a terrain-safe route, then click "Attach to Response Episode" to lock this route for operational field response.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {attachError && <p className="form-error notice-box">{attachError}</p>}
 
       <div className="route-layout">
         <aside className="route-config panel">

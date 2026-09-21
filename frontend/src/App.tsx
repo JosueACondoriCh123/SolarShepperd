@@ -19,6 +19,8 @@ const MissionsPage = lazy(() => import("./pages/MissionsPage").then((module) => 
 const SamplesPage = lazy(() => import("./pages/SamplesPage").then((module) => ({ default: module.SamplesPage })));
 const ReportsPage = lazy(() => import("./pages/ReportsPage").then((module) => ({ default: module.ReportsPage })));
 const AlertsPage = lazy(() => import("./pages/AlertsPage").then((module) => ({ default: module.AlertsPage })));
+const ResponsesPage = lazy(() => import("./pages/ResponsesPage").then((module) => ({ default: module.ResponsesPage })));
+const ResponseDetailPage = lazy(() => import("./pages/ResponseDetailPage").then((module) => ({ default: module.ResponseDetailPage })));
 const TeamPage = lazy(() => import("./pages/TeamPage").then((module) => ({ default: module.TeamPage })));
 const DataSourcesPage = lazy(() => import("./pages/DataSourcesPage").then((module) => ({ default: module.DataSourcesPage })));
 const SettingsPage = lazy(() => import("./pages/SettingsPage").then((module) => ({ default: module.SettingsPage })));
@@ -40,7 +42,7 @@ function ConsoleLayout() {
 const owner = (element: ReactNode) => <OwnerRoute>{element}</OwnerRoute>;
 const legacySections = [
   "dashboard", "field-flow", "telemetry", "landscape", "routes", "capacity", "missions", "samples",
-  "reports", "alerts", "operations", "data-sources", "team", "settings",
+  "reports", "alerts", "responses", "operations", "data-sources", "team", "settings",
 ] as const;
 
 function LegacyConsoleRedirect({ section }: { section: string }) {
@@ -75,6 +77,8 @@ export default function App() {
         <Route path="routes" element={<RoutePlannerPage />} />
         <Route path="capacity" element={<CapacityPage />} />
         <Route path="missions" element={<MissionsPage />} />
+        <Route path="responses" element={<ResponsesPage />} />
+        <Route path="responses/:caseId" element={<ResponseDetailPage />} />
         <Route path="samples" element={<SamplesPage />} />
         <Route path="reports" element={<ReportsPage />} />
         <Route path="alerts" element={<AlertsPage />} />
@@ -83,7 +87,7 @@ export default function App() {
         <Route path="data-sources" element={owner(<DataSourcesPage />)} />
         <Route path="team" element={owner(<TeamPage />)} />
       </Route>
-      {(["telemetry", "landscape", "routes", "capacity", "operations"] as const).map((path) => (
+      {(["telemetry", "landscape", "routes", "capacity", "operations", "responses"] as const).map((path) => (
         <Route key={path} path={`/${path}`} element={<LegacyConsoleRedirect section={path} />} />
       ))}
       <Route path="*" element={<Navigate to="/" replace />} />

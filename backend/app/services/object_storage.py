@@ -52,6 +52,11 @@ class ObjectStorage:
                 8 * 1024 * 1024,
             ),
             (
+                self.settings.response_evidence_bucket,
+                ["image/jpeg", "image/png", "image/webp"],
+                8 * 1024 * 1024,
+            ),
+            (
                 self.settings.reports_bucket,
                 ["application/pdf", "application/json"],
                 20 * 1024 * 1024,

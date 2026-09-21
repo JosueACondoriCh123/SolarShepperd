@@ -67,6 +67,130 @@ async function mockOperationalApi(page: Page) {
       await route.fulfill({ json: { data: [], count: 0 } });
       return;
     }
+    if (path.endsWith("/response-cases")) {
+      await route.fulfill({
+        json: {
+          data: [
+            {
+              id: "33333333-3333-4333-8333-333333333333",
+              pilot_slug: "jkuat",
+              owner_user_id: "00000000-0000-4000-8000-000000000001",
+              rule_id: "44444444-4444-4444-8444-444444444444",
+              rule_name: "High Temperature Critical",
+              mission_id: "55555555-5555-4555-8555-555555555555",
+              mission_title: "Response Mission: High Temperature Critical",
+              mission_status: "planned",
+              status: "triage",
+              severity: "critical",
+              revision: 1,
+              resolution_notes: null,
+              dismissal_reason: null,
+              acknowledged_at: null,
+              started_at: null,
+              completed_at: null,
+              closed_at: null,
+              dismissed_at: null,
+              alert_count: 1,
+              update_count: 0,
+              route_run_id: null,
+              created_at: "2026-09-19T09:30:00Z",
+              updated_at: "2026-09-19T09:30:00Z",
+            },
+          ],
+          count: 1,
+        },
+      });
+      return;
+    }
+    if (/\/response-cases\/[^/]+$/.test(path)) {
+      await route.fulfill({
+        json: {
+          id: "33333333-3333-4333-8333-333333333333",
+          pilot_slug: "jkuat",
+          owner_user_id: "00000000-0000-4000-8000-000000000001",
+          rule_id: "44444444-4444-4444-8444-444444444444",
+          rule_name: "High Temperature Critical",
+          mission_id: "55555555-5555-4555-8555-555555555555",
+          mission_title: "Response Mission: High Temperature Critical",
+          mission_status: "planned",
+          status: "triage",
+          severity: "critical",
+          revision: 1,
+          resolution_notes: null,
+          dismissal_reason: null,
+          acknowledged_at: null,
+          started_at: null,
+          completed_at: null,
+          closed_at: null,
+          dismissed_at: null,
+          alert_count: 1,
+          update_count: 0,
+          route_run_id: null,
+          created_at: "2026-09-19T09:30:00Z",
+          updated_at: "2026-09-19T09:30:00Z",
+          case: {
+            id: "33333333-3333-4333-8333-333333333333",
+            pilot_slug: "jkuat",
+            owner_user_id: "00000000-0000-4000-8000-000000000001",
+            status: "triage",
+            severity: "critical",
+            revision: 1,
+            resolution_notes: null,
+            dismissal_reason: null,
+            acknowledged_at: null,
+            started_at: null,
+            completed_at: null,
+            closed_at: null,
+            dismissed_at: null,
+            created_at: "2026-09-19T09:30:00Z",
+            updated_at: "2026-09-19T09:30:00Z",
+          },
+          rule: {
+            id: "44444444-4444-4444-8444-444444444444",
+            pilot_slug: "jkuat",
+            name: "High Temperature Critical",
+            metric: "temperature_c",
+            condition: "gt",
+            threshold: 35.0,
+            severity: "critical",
+            response_mode: "case_and_mission",
+            window_minutes: 60,
+            is_active: true,
+          },
+          mission: {
+            id: "55555555-5555-4555-8555-555555555555",
+            pilot_slug: "jkuat",
+            title: "Response Mission: High Temperature Critical",
+            status: "planned",
+            route_run_id: null,
+            response_case_id: "33333333-3333-4333-8333-333333333333",
+          },
+          route: null,
+          alerts: [
+            {
+              id: "66666666-6666-4666-8666-666666666666",
+              kind: "forecast_threshold",
+              title: "Forecast threshold triggered",
+              message: "Forecast 36.2 °C exceeds threshold 35.0 °C",
+              severity: "critical",
+              payload: { metric: "temperature_c", value: 36.2, threshold: 35.0 },
+              is_forecast: true,
+              created_at: "2026-09-19T09:30:00Z",
+            },
+          ],
+          updates: [],
+          report: null,
+          timeline: [],
+          next_action: {
+            stage: "Verify",
+            action: "acknowledge",
+            label: "Acknowledge alert and review evidence",
+            description: "Confirm the signal was received and inspect whether it represents a forecast or observation.",
+          },
+        },
+      });
+      return;
+    }
     if (path.endsWith("/admin/members")) {
       await route.fulfill({ json: { data: [], count: 0 } });
       return;
@@ -241,6 +365,7 @@ test("opens member field-work and management screens", async ({ page }) => {
   for (const [path, heading] of [
     ["/app/jkuat/dashboard", /Good field work starts here/i],
     ["/app/jkuat/missions", "Missions"],
+    ["/app/jkuat/responses", "Response Center"],
     ["/app/jkuat/samples", "Samples"],
     ["/app/jkuat/reports", "Mission reports"],
     ["/app/jkuat/alerts", "Alerts"],
@@ -252,3 +377,17 @@ test("opens member field-work and management screens", async ({ page }) => {
     await expect(page.getByRole("heading", { level: 1, name: heading })).toBeVisible();
   }
 });
+
+test("navigates response center and views episode detail", async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("solarshepherd-dev-role", "member"));
+  await page.goto("/app/jkuat/responses");
+  await expect(page.getByRole("heading", { level: 1, name: "Response Center" })).toBeVisible();
+  await expect(page.getByText("Response: High Temperature Critical").first()).toBeVisible();
+  await expect(page.locator(".severity-chip.critical")).toBeVisible();
+  await page.getByRole("link", { name: /Open Response Episode/i }).click();
+  await expect(page).toHaveURL(/\/app\/jkuat\/responses\/33333333-3333-4333-8333-333333333333$/);
+  await expect(page.getByRole("heading", { level: 1, name: "Response: High Temperature Critical" })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Acknowledge Alert & Evidence/i })).toBeVisible();
+});
+
+

@@ -6,6 +6,7 @@ from io import BytesIO
 from typing import Any
 from uuid import UUID
 
+from geoalchemy2.shape import to_shape
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet
@@ -15,9 +16,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.models import (
+    Alert,
     ForecastRun,
     Mission,
     ReportRun,
+    ResponseCase,
+    ResponseUpdate,
     RouteRun,
     SampleSubmission,
     SatelliteScene,
@@ -84,6 +88,75 @@ async def build_report(session: AsyncSession, settings: Settings, report_id: UUI
                 SampleSubmission.sampled_at <= mission.scheduled_end
             )
         samples = list((await session.execute(sample_statement)).scalars())
+
+        # Inspect if mission belongs to a ResponseCase
+        response_case = (
+            await session.execute(
+                select(ResponseCase).where(ResponseCase.mission_id == mission.id).limit(1)
+            )
+        ).scalar_one_or_none()
+        response_case_data = None
+        if response_case:
+            alert_rows = list(
+                (
+                    await session.execute(
+                        select(Alert)
+                        .where(Alert.response_case_id == response_case.id)
+                        .order_by(Alert.created_at)
+                    )
+                ).scalars()
+            )
+            update_rows = list(
+                (
+                    await session.execute(
+                        select(ResponseUpdate)
+                        .where(ResponseUpdate.response_case_id == response_case.id)
+                        .order_by(ResponseUpdate.created_at)
+                    )
+                ).scalars()
+            )
+            response_case_data = {
+                "id": str(response_case.id),
+                "status": response_case.status,
+                "severity": response_case.severity,
+                "resolution_notes": response_case.resolution_notes,
+                "dismissal_reason": response_case.dismissal_reason,
+                "acknowledged_at": response_case.acknowledged_at.isoformat()
+                if response_case.acknowledged_at
+                else None,
+                "started_at": response_case.started_at.isoformat()
+                if response_case.started_at
+                else None,
+                "completed_at": response_case.completed_at.isoformat()
+                if response_case.completed_at
+                else None,
+                "closed_at": response_case.closed_at.isoformat()
+                if response_case.closed_at
+                else None,
+                "originating_alerts": [
+                    {
+                        "id": str(a.id),
+                        "kind": a.kind,
+                        "title": a.title,
+                        "message": a.message,
+                        "severity": a.severity,
+                        "is_forecast": a.kind == "forecast_threshold",
+                        "created_at": a.created_at.isoformat(),
+                    }
+                    for a in alert_rows
+                ],
+                "updates": [
+                    {
+                        "id": str(u.id),
+                        "notes": u.notes,
+                        "latitude": to_shape(u.geom).y if u.geom else None,
+                        "longitude": to_shape(u.geom).x if u.geom else None,
+                        "created_at": u.created_at.isoformat(),
+                    }
+                    for u in update_rows
+                ],
+            }
+
         manifest: dict[str, Any] = {
             "schema_version": "solarshepherd-mission-evidence-v1",
             "generated_at": datetime.now(UTC).isoformat(),
@@ -127,6 +200,7 @@ async def build_report(session: AsyncSession, settings: Settings, report_id: UUI
                 }
                 for sample in samples
             ],
+            "response_case": response_case_data,
             "scientific_guardrails": {
                 "biomass": "CALIBRATION_REQUIRED",
                 "gch": "CALIBRATION_REQUIRED",
@@ -224,6 +298,63 @@ def _render_pdf(manifest: dict[str, Any]) -> bytes:
                 styles["Italic"],
             )
         )
+
+    resp_case = manifest.get("response_case")
+    if resp_case:
+        story.extend(
+            [
+                Spacer(1, 14),
+                Paragraph("Response Center Episode", styles["Heading2"]),
+                Table(
+                    [
+                        ["Episode ID", str(resp_case.get("id", ""))[:18] + "..."],
+                        ["Episode status", str(resp_case.get("status", "")).upper()],
+                        ["Severity", str(resp_case.get("severity", "")).upper()],
+                        ["Acknowledged at", resp_case.get("acknowledged_at") or "Pending"],
+                        ["Started at", resp_case.get("started_at") or "Pending"],
+                        ["Completed at", resp_case.get("completed_at") or "Pending"],
+                        ["Resolution notes", resp_case.get("resolution_notes") or "Open"],
+                    ],
+                    colWidths=[160, 320],
+                ),
+            ]
+        )
+        originating_alerts = resp_case.get("originating_alerts", [])
+        if originating_alerts:
+            story.append(Spacer(1, 8))
+            story.append(Paragraph("Originating Alert Signals", styles["Heading3"]))
+            alert_rows = [["Signal Title", "Type", "Severity", "Triggered At"]]
+            for a in originating_alerts[:10]:
+                type_label = (
+                    "FORECAST (Advisory)" if a.get("is_forecast") else "OBSERVATION (Real)"
+                )
+                alert_rows.append(
+                    [
+                        str(a.get("title", ""))[:28],
+                        type_label,
+                        str(a.get("severity", "")).upper(),
+                        str(a.get("created_at", ""))[:16].replace("T", " "),
+                    ]
+                )
+            story.append(Table(alert_rows, colWidths=[160, 130, 80, 110]))
+
+        updates = resp_case.get("updates", [])
+        if updates:
+            story.append(Spacer(1, 8))
+            story.append(Paragraph("Response Field Updates", styles["Heading3"]))
+            update_rows = [["Notes", "Coordinates", "Timestamp"]]
+            for u in updates[:15]:
+                lat = u.get("latitude")
+                lon = u.get("longitude")
+                coords = f"{lat:.4f}, {lon:.4f}" if lat is not None and lon is not None else "N/A"
+                update_rows.append(
+                    [
+                        str(u.get("notes", ""))[:45],
+                        coords,
+                        str(u.get("created_at", ""))[:16].replace("T", " "),
+                    ]
+                )
+            story.append(Table(update_rows, colWidths=[240, 120, 120]))
 
     story.extend(
         [

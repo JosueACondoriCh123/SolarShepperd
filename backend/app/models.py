@@ -396,7 +396,84 @@ class AlertRule(Base, TimestampMixin):
     cooldown_minutes: Mapped[int] = mapped_column(Integer, default=180)
     channels: Mapped[list[str]] = mapped_column(JSONB, default=lambda: ["in_app"])
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    severity: Mapped[str] = mapped_column(String(16), default="warning")
+    response_mode: Mapped[str] = mapped_column(String(24), default="case_and_mission")
     last_triggered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ResponseCase(Base, TimestampMixin):
+    __tablename__ = "response_cases"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    pilot_slug: Mapped[str] = mapped_column(
+        String(32), ForeignKey("pilots.slug"), default="jkuat", index=True
+    )
+    owner_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user_profiles.auth_user_id", ondelete="CASCADE"), index=True
+    )
+    rule_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("alert_rules.id", ondelete="SET NULL"), index=True
+    )
+    mission_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("missions.id", ondelete="CASCADE"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(24), default="triage", index=True)
+    severity: Mapped[str] = mapped_column(String(16), default="warning")
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    resolution_notes: Mapped[str | None] = mapped_column(Text)
+    dismissal_reason: Mapped[str | None] = mapped_column(Text)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    dismissed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    rule: Mapped[AlertRule | None] = relationship()
+    mission: Mapped[Mission] = relationship()
+    alerts: Mapped[list[Alert]] = relationship(back_populates="response_case")
+    updates: Mapped[list[ResponseUpdate]] = relationship(
+        back_populates="case", cascade="all, delete-orphan", order_by="ResponseUpdate.created_at"
+    )
+
+
+class ResponseUpdate(Base):
+    __tablename__ = "response_updates"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    response_case_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("response_cases.id", ondelete="CASCADE"), index=True
+    )
+    author_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user_profiles.auth_user_id", ondelete="CASCADE"), index=True
+    )
+    notes: Mapped[str] = mapped_column(Text)
+    geom: Mapped[Any] = mapped_column(Geometry("POINT", srid=4326), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+    case: Mapped[ResponseCase] = relationship(back_populates="updates")
+    author: Mapped[UserProfile] = relationship()
+    attachments: Mapped[list[ResponseAttachment]] = relationship(
+        cascade="all, delete-orphan", order_by="ResponseAttachment.created_at"
+    )
+
+
+class ResponseAttachment(Base):
+    __tablename__ = "response_attachments"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    update_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("response_updates.id", ondelete="CASCADE"), index=True
+    )
+    object_key: Mapped[str] = mapped_column(String(512), unique=True)
+    original_filename: Mapped[str] = mapped_column(String(255))
+    content_type: Mapped[str] = mapped_column(String(64))
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    checksum: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
 
 
 class Alert(Base):
@@ -412,6 +489,9 @@ class Alert(Base):
     rule_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("alert_rules.id", ondelete="SET NULL"), index=True
     )
+    response_case_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("response_cases.id", ondelete="SET NULL"), index=True
+    )
     kind: Mapped[str] = mapped_column(String(32), index=True)
     title: Mapped[str] = mapped_column(String(180))
     message: Mapped[str] = mapped_column(Text)
@@ -422,6 +502,8 @@ class Alert(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
     acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    response_case: Mapped[ResponseCase | None] = relationship(back_populates="alerts")
 
 
 class NotificationDelivery(Base):

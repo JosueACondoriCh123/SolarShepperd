@@ -1,6 +1,6 @@
 import {
   Activity, Bell, ChevronRight, CircleDotDashed, DatabaseZap, FileText, Gauge, Hexagon, Home,
-  LogOut, Map, MoreHorizontal, Route as RouteIcon, Settings, ShieldCheck, Sprout, Users,
+  LogOut, Map, MoreHorizontal, Route as RouteIcon, Settings, ShieldAlert, ShieldCheck, Sprout, Users,
 } from "lucide-react";
 import type { PropsWithChildren } from "react";
 import { useEffect, useState } from "react";
@@ -18,6 +18,7 @@ const navigation = [
   { group: "Observe", section: "landscape", label: "Landscape", icon: Map, access: "all" },
   { group: "Plan", section: "routes", label: "Route planner", icon: RouteIcon, access: "all" },
   { group: "Plan", section: "missions", label: "Missions", icon: ChevronRight, access: "member" },
+  { group: "Plan", section: "responses", label: "Response Center", icon: ShieldAlert, access: "member" },
   { group: "Evidence", section: "samples", label: "Samples", icon: Sprout, access: "member" },
   { group: "Evidence", section: "capacity", label: "Capacity", icon: Gauge, access: "all" },
   { group: "Evidence", section: "reports", label: "Reports", icon: FileText, access: "member" },

@@ -32,6 +32,9 @@ from app.models import (
     Mission,
     NotificationDelivery,
     ReportRun,
+    ResponseAttachment,
+    ResponseCase,
+    ResponseUpdate,
     RouteRun,
     SampleAttachment,
     SampleSubmission,
@@ -48,6 +51,13 @@ from app.operational_schemas import (
     MissionPatch,
     ProfilePatch,
     ReportCreate,
+    ResponseCaseAcknowledge,
+    ResponseCaseClose,
+    ResponseCaseComplete,
+    ResponseCaseDismiss,
+    ResponseCaseRoute,
+    ResponseCaseStart,
+    ResponseUpdateCreate,
     SampleReview,
     SampleSubmissionCreate,
 )
@@ -89,7 +99,9 @@ def _profile(profile: UserProfile) -> dict[str, Any]:
     }
 
 
-def _mission(item: Mission, sample_count: int = 0) -> dict[str, Any]:
+def _mission(
+    item: Mission, sample_count: int = 0, response_case_id: str | None = None
+) -> dict[str, Any]:
     return {
         "id": str(item.id),
         "pilot_slug": item.pilot_slug,
@@ -105,6 +117,7 @@ def _mission(item: Mission, sample_count: int = 0) -> dict[str, Any]:
         "started_at": item.started_at,
         "completed_at": item.completed_at,
         "sample_count": sample_count,
+        "response_case_id": response_case_id,
         "created_at": item.created_at,
         "updated_at": item.updated_at,
     }
@@ -457,7 +470,10 @@ async def field_flow(
     telemetry_age = (
         max(0.0, (now - telemetry.observed_at).total_seconds()) if telemetry else None
     )
-    telemetry_fresh = telemetry_age is not None and telemetry_age <= timedelta(hours=6).total_seconds()
+    telemetry_fresh = (
+        telemetry_age is not None
+        and telemetry_age <= timedelta(hours=6).total_seconds()
+    )
     forecast_current = bool(forecast and forecast.valid_from <= now <= forecast.valid_to)
     scene_usable = bool(
         scene
@@ -696,8 +712,28 @@ async def list_missions(
         if rows
         else {}
     )
+    case_map = (
+        dict(
+            (
+                await session.execute(
+                    select(ResponseCase.mission_id, ResponseCase.id).where(
+                        ResponseCase.mission_id.in_([item.id for item in rows])
+                    )
+                )
+            ).all()
+        )
+        if rows
+        else {}
+    )
     return {
-        "data": [_mission(item, counts.get(item.id, 0)) for item in rows],
+        "data": [
+            _mission(
+                item,
+                counts.get(item.id, 0),
+                str(case_map[item.id]) if item.id in case_map else None,
+            )
+            for item in rows
+        ],
         "count": len(rows),
     }
 
@@ -792,7 +828,14 @@ async def get_mission(
             .where(SampleSubmission.mission_id == mission.id)
         )
     ).scalar_one()
-    return _mission(mission, sample_count)
+    resp_case_id = (
+        await session.execute(
+            select(ResponseCase.id).where(ResponseCase.mission_id == mission.id).limit(1)
+        )
+    ).scalar_one_or_none()
+    return _mission(
+        mission, sample_count, str(resp_case_id) if resp_case_id else None
+    )
 
 
 @router.post("/missions/{mission_id}/duplicate", status_code=201)
@@ -923,6 +966,21 @@ async def patch_mission(
             details={"current_revision": mission.revision},
         )
     updates = request.model_dump(exclude_unset=True, exclude={"revision"})
+    if "status" in updates or "route_run_id" in updates:
+        resp_case = (
+            await session.execute(
+                select(ResponseCase).where(ResponseCase.mission_id == mission.id)
+            )
+        ).scalar_one_or_none()
+        if resp_case is not None:
+            raise APIError(
+                "RESPONSE_MISSION_RESTRICTED",
+                (
+                    "Status and route transitions for response missions "
+                    "must be performed via the Response Center."
+                ),
+                status_code=409,
+            )
     if "route_run_id" in updates and updates["route_run_id"]:
         route = await session.get(RouteRun, updates["route_run_id"])
         if (
@@ -1404,6 +1462,8 @@ def _alert_rule(item: AlertRule) -> dict[str, Any]:
         "cooldown_minutes": item.cooldown_minutes,
         "channels": item.channels,
         "enabled": item.enabled,
+        "severity": getattr(item, "severity", "warning") or "warning",
+        "response_mode": getattr(item, "response_mode", "case_and_mission") or "case_and_mission",
         "last_triggered_at": item.last_triggered_at,
     }
 
@@ -1491,6 +1551,7 @@ async def list_alerts(
             {
                 "id": str(item.id),
                 "pilot_slug": item.pilot_slug,
+                "response_case_id": str(item.response_case_id) if item.response_case_id else None,
                 "kind": item.kind,
                 "title": item.title,
                 "message": item.message,
@@ -1706,3 +1767,989 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     delta_lon = radians(lon2 - lon1)
     a = sin(delta_lat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(delta_lon / 2) ** 2
     return 2 * 6371.0088 * asin(sqrt(a))
+
+
+# ---------------------------------------------------------------------------
+# Response Center (Alert-to-Action Workflow: Detect -> Verify -> Route -> Respond -> Prove)
+# ---------------------------------------------------------------------------
+
+
+async def _owned_response_case(
+    session: AsyncSession,
+    case_id: UUID,
+    profile: UserProfile,
+    pilot_slug: str = "jkuat",
+) -> ResponseCase:
+    case = await session.get(ResponseCase, case_id)
+    if (
+        case is None
+        or (case.pilot_slug or "jkuat") != pilot_slug
+        or (case.owner_user_id != profile.auth_user_id and not profile.is_system_owner)
+    ):
+        raise APIError("OWNERSHIP_REQUIRED", "Response case not found.", status_code=404)
+    return case
+
+
+def _response_case_summary(
+    item: ResponseCase,
+    rule_name: str | None = None,
+    mission_title: str | None = None,
+    mission_status: str | None = None,
+    alert_count: int = 0,
+    update_count: int = 0,
+    route_run_id: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "id": str(item.id),
+        "pilot_slug": item.pilot_slug,
+        "owner_user_id": str(item.owner_user_id),
+        "rule_id": str(item.rule_id) if item.rule_id else None,
+        "rule_name": rule_name,
+        "mission_id": str(item.mission_id),
+        "mission_title": mission_title,
+        "mission_status": mission_status,
+        "status": item.status,
+        "severity": item.severity,
+        "revision": item.revision,
+        "resolution_notes": item.resolution_notes,
+        "dismissal_reason": item.dismissal_reason,
+        "acknowledged_at": item.acknowledged_at,
+        "started_at": item.started_at,
+        "completed_at": item.completed_at,
+        "closed_at": item.closed_at,
+        "dismissed_at": item.dismissed_at,
+        "alert_count": alert_count,
+        "update_count": update_count,
+        "route_run_id": route_run_id,
+        "created_at": item.created_at,
+        "updated_at": item.updated_at,
+    }
+
+
+@router.get("/response-cases")
+async def list_response_cases(
+    profile: ProfileDependency,
+    session: SessionDependency,
+    pilot: str = Query(default="jkuat"),
+    status: str | None = None,
+    severity: str | None = None,
+    rule_id: UUID | None = None,
+) -> dict[str, Any]:
+    pilot_definition = _require_pilot(pilot)
+    statement = select(ResponseCase).where(ResponseCase.pilot_slug == pilot_definition.slug)
+    if not profile.is_system_owner:
+        statement = statement.where(ResponseCase.owner_user_id == profile.auth_user_id)
+    if status:
+        statement = statement.where(ResponseCase.status == status)
+    if severity:
+        statement = statement.where(ResponseCase.severity == severity)
+    if rule_id:
+        statement = statement.where(ResponseCase.rule_id == rule_id)
+
+    result = await session.execute(statement.order_by(ResponseCase.created_at.desc()))
+    rows = list(result.scalars())
+    if not rows:
+        return {"data": [], "count": 0}
+
+    case_ids = [c.id for c in rows]
+    mission_ids = [c.mission_id for c in rows]
+    rule_ids = [c.rule_id for c in rows if c.rule_id is not None]
+
+    missions_map = (
+        dict(
+            (
+                await session.execute(
+                    select(Mission.id, Mission).where(Mission.id.in_(mission_ids))
+                )
+            ).all()
+        )
+        if mission_ids
+        else {}
+    )
+
+    rules_map = (
+        dict(
+            (
+                await session.execute(
+                    select(AlertRule.id, AlertRule.name).where(AlertRule.id.in_(rule_ids))
+                )
+            ).all()
+        )
+        if rule_ids
+        else {}
+    )
+
+    alert_counts = (
+        dict(
+            (
+                await session.execute(
+                    select(Alert.response_case_id, func.count())
+                    .where(Alert.response_case_id.in_(case_ids))
+                    .group_by(Alert.response_case_id)
+                )
+            ).all()
+        )
+        if case_ids
+        else {}
+    )
+
+    update_counts = (
+        dict(
+            (
+                await session.execute(
+                    select(ResponseUpdate.response_case_id, func.count())
+                    .where(ResponseUpdate.response_case_id.in_(case_ids))
+                    .group_by(ResponseUpdate.response_case_id)
+                )
+            ).all()
+        )
+        if case_ids
+        else {}
+    )
+
+    data = []
+    for c in rows:
+        m = missions_map.get(c.mission_id)
+        data.append(
+            _response_case_summary(
+                c,
+                rule_name=rules_map.get(c.rule_id) if c.rule_id else None,
+                mission_title=m.title if m else None,
+                mission_status=m.status if m else None,
+                alert_count=alert_counts.get(c.id, 0),
+                update_count=update_counts.get(c.id, 0),
+                route_run_id=str(m.route_run_id) if m and m.route_run_id else None,
+            )
+        )
+    return {"data": data, "count": len(data)}
+
+
+@router.get("/response-cases/{case_id}")
+async def get_response_case(
+    case_id: UUID,
+    profile: ProfileDependency,
+    session: SessionDependency,
+    pilot: str = Query(default="jkuat"),
+) -> dict[str, Any]:
+    pilot_definition = _require_pilot(pilot)
+    case = await _owned_response_case(session, case_id, profile, pilot_definition.slug)
+    mission = await session.get(Mission, case.mission_id)
+    rule = await session.get(AlertRule, case.rule_id) if case.rule_id else None
+    route = (
+        await session.get(RouteRun, mission.route_run_id)
+        if mission and mission.route_run_id
+        else None
+    )
+
+    alerts = list(
+        (
+            await session.execute(
+                select(Alert)
+                .where(Alert.response_case_id == case.id)
+                .order_by(Alert.created_at.desc())
+            )
+        ).scalars()
+    )
+
+    updates = list(
+        (
+            await session.execute(
+                select(ResponseUpdate)
+                .where(ResponseUpdate.response_case_id == case.id)
+                .order_by(ResponseUpdate.created_at.desc())
+            )
+        ).scalars()
+    )
+
+    update_ids = [u.id for u in updates]
+    attachments = (
+        list(
+            (
+                await session.execute(
+                    select(ResponseAttachment).where(ResponseAttachment.update_id.in_(update_ids))
+                )
+            ).scalars()
+        )
+        if update_ids
+        else []
+    )
+    attachments_by_update: dict[UUID, list[dict[str, Any]]] = {}
+    for att in attachments:
+        attachments_by_update.setdefault(att.update_id, []).append(
+            {
+                "id": str(att.id),
+                "original_filename": att.original_filename,
+                "content_type": att.content_type,
+                "size_bytes": att.size_bytes,
+                "download_url": f"/api/v1/response-attachments/{att.id}/download",
+                "created_at": att.created_at,
+            }
+        )
+
+    report = (
+        await session.execute(
+            select(ReportRun)
+            .where(ReportRun.mission_id == case.mission_id)
+            .order_by(ReportRun.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+    audit_rows = list(
+        (
+            await session.execute(
+                select(AuditEvent)
+                .where(AuditEvent.entity_id.in_([str(case.id), str(case.mission_id)]))
+                .order_by(AuditEvent.occurred_at.desc())
+            )
+        ).scalars()
+    )
+
+    # Determine deterministic next action
+    if case.status == "triage":
+        if not case.acknowledged_at:
+            next_action = {
+                "stage": "Verify",
+                "action": "acknowledge",
+                "label": "Acknowledge alert and review evidence",
+                "description": (
+                    "Confirm the signal was received and inspect whether it represents "
+                    "a forecast or observation."
+                ),
+            }
+        else:
+            next_action = {
+                "stage": "Route",
+                "action": "route",
+                "label": "Attach verified route in Route Planner",
+                "description": (
+                    "Calculate and attach a real terrain-safe route before "
+                    "starting field response."
+                ),
+            }
+    elif case.status == "ready":
+        next_action = {
+            "stage": "Respond",
+            "action": "start",
+            "label": "Start response mission",
+            "description": (
+                "Alert acknowledged and route attached. Start the operational field response."
+            ),
+        }
+    elif case.status == "responding":
+        next_action = {
+            "stage": "Respond",
+            "action": "complete",
+            "label": "Complete response mission",
+            "description": (
+                "Field movement is finished. Complete the mission to trigger automatic "
+                "evidence report compilation."
+            ),
+        }
+    elif case.status == "review":
+        if not report or report.status in {"queued", "processing"}:
+            next_action = {
+                "stage": "Prove",
+                "action": "waiting_report",
+                "label": "Evidence report is generating...",
+                "description": "Worker is compiling verified PDF and JSON receipts.",
+            }
+        elif report.status == "failed":
+            next_action = {
+                "stage": "Prove",
+                "action": "retry_report",
+                "label": "Retry report generation",
+                "description": (
+                    "Evidence generation encountered an issue. Re-queue compiling report."
+                ),
+            }
+        else:
+            next_action = {
+                "stage": "Prove",
+                "action": "close",
+                "label": "Close episode with resolution notes",
+                "description": (
+                    "Evidence package is ready. Enter resolution notes to seal "
+                    "the operational response."
+                ),
+            }
+    elif case.status == "closed":
+        next_action = {
+            "stage": "Prove",
+            "action": "none",
+            "label": "Episode closed",
+            "description": f"Resolution: {case.resolution_notes or 'Closed successfully.'}",
+        }
+    else:
+        next_action = {
+            "stage": "Verify",
+            "action": "none",
+            "label": "Episode dismissed",
+            "description": f"Dismissal reason: {case.dismissal_reason or 'No reason provided.'}",
+        }
+
+    summary = _response_case_summary(
+        case,
+        rule_name=rule.name if rule else None,
+        mission_title=mission.title if mission else None,
+        mission_status=mission.status if mission else None,
+        alert_count=len(alerts),
+        update_count=len(updates),
+        route_run_id=str(mission.route_run_id) if mission and mission.route_run_id else None,
+    )
+
+    return {
+        **summary,
+        "case": summary,
+        "rule": _alert_rule(rule) if rule else None,
+        "mission": _mission(mission, response_case_id=str(case.id)) if mission else None,
+        "route": {
+            "id": str(route.id),
+            "name": route.name or f"Route {str(route.id)[:8]}",
+            "total_distance_m": route.total_distance_m,
+            "estimated_time_s": route.total_time_s,
+            "geojson": route.geojson,
+            "profile": route.parameters.get("profile", "resource_aware"),
+        }
+        if route
+        else None,
+        "alerts": [
+            {
+                "id": str(a.id),
+                "kind": a.kind,
+                "title": a.title,
+                "message": a.message,
+                "severity": a.severity,
+                "payload": a.payload,
+                "is_forecast": a.kind == "forecast_threshold",
+                "created_at": a.created_at,
+                "acknowledged_at": a.acknowledged_at,
+            }
+            for a in alerts
+        ],
+        "updates": [
+            {
+                "id": str(u.id),
+                "author_user_id": str(u.author_user_id),
+                "notes": u.notes,
+                "latitude": to_shape(u.geom).y if u.geom else None,
+                "longitude": to_shape(u.geom).x if u.geom else None,
+                "created_at": u.created_at,
+                "attachments": attachments_by_update.get(u.id, []),
+            }
+            for u in updates
+        ],
+        "report": {
+            "id": str(report.id),
+            "status": report.status,
+            "created_at": report.created_at,
+            "completed_at": report.completed_at,
+            "error_message": report.error_message,
+            "downloads": {
+                "pdf": f"/api/v1/reports/{report.id}/download/pdf"
+                if report.status == "ready"
+                else None,
+                "json": f"/api/v1/reports/{report.id}/download/json"
+                if report.status == "ready"
+                else None,
+            },
+        }
+        if report
+        else None,
+        "timeline": [
+            {
+                "id": str(ev.id),
+                "action": ev.action,
+                "entity_type": ev.entity_type,
+                "entity_id": ev.entity_id,
+                "details": ev.details,
+                "occurred_at": ev.occurred_at,
+            }
+            for ev in audit_rows
+        ],
+        "next_action": next_action,
+    }
+
+
+@router.post("/response-cases/{case_id}/acknowledge")
+async def acknowledge_response_case(
+    case_id: UUID,
+    request: ResponseCaseAcknowledge,
+    profile: ProfileDependency,
+    session: SessionDependency,
+    pilot: str = Query(default="jkuat"),
+) -> dict[str, Any]:
+    pilot_definition = _require_pilot(pilot)
+    case = await _owned_response_case(session, case_id, profile, pilot_definition.slug)
+    if case.status not in {"triage"}:
+        raise APIError(
+            "INVALID_TRANSITION",
+            f"Case in status '{case.status}' cannot be acknowledged.",
+            status_code=409,
+        )
+    if request.revision != case.revision:
+        raise APIError(
+            "REVISION_CONFLICT",
+            "The response case was modified by another session. Refresh before saving.",
+            status_code=409,
+            details={"current_revision": case.revision},
+        )
+
+    now = datetime.now(UTC)
+    case.acknowledged_at = now
+    # Acknowledge all alerts attached to this case
+    await session.execute(
+        select(Alert).where(Alert.response_case_id == case.id)
+    )
+    linked_alerts = list(
+        (
+            await session.execute(
+                select(Alert).where(Alert.response_case_id == case.id)
+            )
+        ).scalars()
+    )
+    for a in linked_alerts:
+        if not a.acknowledged_at:
+            a.acknowledged_at = now
+
+    mission = await session.get(Mission, case.mission_id)
+    if mission and mission.route_run_id:
+        case.status = "ready"
+
+    case.revision += 1
+    session.add(
+        AuditEvent(
+            actor_user_id=profile.auth_user_id,
+            action="response_case.acknowledged",
+            entity_type="response_case",
+            entity_id=str(case.id),
+            details={"status": case.status, "revision": case.revision},
+        )
+    )
+    await session.commit()
+    await session.refresh(case)
+    return {"id": str(case.id), "status": case.status, "revision": case.revision}
+
+
+@router.post("/response-cases/{case_id}/route")
+async def attach_response_case_route(
+    case_id: UUID,
+    request: ResponseCaseRoute,
+    profile: ProfileDependency,
+    session: SessionDependency,
+    pilot: str = Query(default="jkuat"),
+) -> dict[str, Any]:
+    pilot_definition = _require_pilot(pilot)
+    case = await _owned_response_case(session, case_id, profile, pilot_definition.slug)
+    if case.status not in {"triage", "ready"}:
+        raise APIError(
+            "INVALID_TRANSITION",
+            f"Route cannot be attached while case is in status '{case.status}'.",
+            status_code=409,
+        )
+    if request.revision != case.revision:
+        raise APIError(
+            "REVISION_CONFLICT",
+            "The response case was modified by another session. Refresh before saving.",
+            status_code=409,
+            details={"current_revision": case.revision},
+        )
+
+    route = await session.get(RouteRun, request.route_id)
+    if (
+        route is None
+        or route.owner_user_id != profile.auth_user_id
+        or route.pilot_slug != case.pilot_slug
+    ):
+        raise APIError("OWNERSHIP_REQUIRED", "The selected route is unavailable.", status_code=422)
+
+    mission = await session.get(Mission, case.mission_id)
+    if mission is None:
+        raise APIError("MISSION_NOT_FOUND", "Associated mission not found.", status_code=404)
+
+    mission.route_run_id = route.id
+    mission.revision += 1
+
+    if case.acknowledged_at:
+        case.status = "ready"
+
+    case.revision += 1
+    session.add(
+        AuditEvent(
+            actor_user_id=profile.auth_user_id,
+            action="response_case.route_attached",
+            entity_type="response_case",
+            entity_id=str(case.id),
+            details={
+                "route_id": str(route.id),
+                "status": case.status,
+                "revision": case.revision,
+            },
+        )
+    )
+    await session.commit()
+    await session.refresh(case)
+    return {
+        "id": str(case.id),
+        "status": case.status,
+        "route_id": str(route.id),
+        "revision": case.revision,
+    }
+
+
+@router.post("/response-cases/{case_id}/start")
+async def start_response_case(
+    case_id: UUID,
+    request: ResponseCaseStart,
+    profile: ProfileDependency,
+    session: SessionDependency,
+    pilot: str = Query(default="jkuat"),
+) -> dict[str, Any]:
+    pilot_definition = _require_pilot(pilot)
+    case = await _owned_response_case(session, case_id, profile, pilot_definition.slug)
+    if request.revision != case.revision:
+        raise APIError(
+            "REVISION_CONFLICT",
+            "The response case was modified by another session. Refresh before saving.",
+            status_code=409,
+            details={"current_revision": case.revision},
+        )
+
+    mission = await session.get(Mission, case.mission_id)
+    if not mission or not mission.route_run_id or not case.acknowledged_at:
+        raise APIError(
+            "CANNOT_START_WITHOUT_ROUTE_AND_ACK",
+            "A response mission cannot be started without route assignment and acknowledgment.",
+            status_code=409,
+        )
+    if case.status != "ready":
+        raise APIError(
+            "INVALID_TRANSITION",
+            f"Case in status '{case.status}' cannot be started.",
+            status_code=409,
+        )
+
+    now = datetime.now(UTC)
+    case.status = "responding"
+    case.started_at = now
+    case.revision += 1
+
+    mission.status = "active"
+    mission.started_at = now
+    mission.revision += 1
+
+    session.add(
+        AuditEvent(
+            actor_user_id=profile.auth_user_id,
+            action="response_case.started",
+            entity_type="response_case",
+            entity_id=str(case.id),
+            details={"status": case.status, "mission_id": str(mission.id)},
+        )
+    )
+    await session.commit()
+    await session.refresh(case)
+    return {"id": str(case.id), "status": case.status, "revision": case.revision}
+
+
+@router.post("/response-cases/{case_id}/complete")
+async def complete_response_case(
+    case_id: UUID,
+    request: ResponseCaseComplete,
+    profile: ProfileDependency,
+    session: SessionDependency,
+    settings: SettingsDependency,
+    pilot: str = Query(default="jkuat"),
+) -> dict[str, Any]:
+    pilot_definition = _require_pilot(pilot)
+    case = await _owned_response_case(session, case_id, profile, pilot_definition.slug)
+    if request.revision != case.revision:
+        raise APIError(
+            "REVISION_CONFLICT",
+            "The response case was modified by another session. Refresh before saving.",
+            status_code=409,
+            details={"current_revision": case.revision},
+        )
+    if case.status != "responding":
+        raise APIError(
+            "INVALID_TRANSITION",
+            f"Case in status '{case.status}' cannot be completed.",
+            status_code=409,
+        )
+
+    now = datetime.now(UTC)
+    case.status = "review"
+    case.completed_at = now
+    case.revision += 1
+
+    mission = await session.get(Mission, case.mission_id)
+    if mission:
+        mission.status = "completed"
+        mission.completed_at = now
+        mission.revision += 1
+
+    # Idempotent report generation
+    report = (
+        await session.execute(
+            select(ReportRun)
+            .where(ReportRun.mission_id == case.mission_id)
+            .order_by(ReportRun.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+    if report is None:
+        report = ReportRun(
+            pilot_slug=case.pilot_slug,
+            owner_user_id=case.owner_user_id,
+            mission_id=case.mission_id,
+            status="queued",
+            parameters={"title": f"Evidence: {mission.title if mission else 'Response mission'}"},
+        )
+        session.add(report)
+        await session.flush()
+        dispatch_report(str(report.id))
+
+    session.add(
+        AuditEvent(
+            actor_user_id=profile.auth_user_id,
+            action="response_case.completed",
+            entity_type="response_case",
+            entity_id=str(case.id),
+            details={"status": case.status, "report_id": str(report.id)},
+        )
+    )
+    await session.commit()
+    await session.refresh(case)
+    return {
+        "id": str(case.id),
+        "status": case.status,
+        "report_id": str(report.id),
+        "revision": case.revision,
+    }
+
+
+@router.post("/response-cases/{case_id}/close")
+async def close_response_case(
+    case_id: UUID,
+    request: ResponseCaseClose,
+    profile: ProfileDependency,
+    session: SessionDependency,
+    pilot: str = Query(default="jkuat"),
+) -> dict[str, Any]:
+    pilot_definition = _require_pilot(pilot)
+    case = await _owned_response_case(session, case_id, profile, pilot_definition.slug)
+    if request.revision != case.revision:
+        raise APIError(
+            "REVISION_CONFLICT",
+            "The response case was modified by another session. Refresh before saving.",
+            status_code=409,
+            details={"current_revision": case.revision},
+        )
+    if case.status != "review":
+        raise APIError(
+            "INVALID_TRANSITION",
+            f"Case in status '{case.status}' cannot be closed.",
+            status_code=409,
+        )
+
+    notes = request.resolution_notes.strip()
+    if not notes:
+        raise APIError(
+            "RESOLUTION_NOTES_REQUIRED", "Resolution notes are required.", status_code=422
+        )
+
+    # Verify that evidence report is ready
+    report = (
+        await session.execute(
+            select(ReportRun)
+            .where(ReportRun.mission_id == case.mission_id)
+            .order_by(ReportRun.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+    if not report or report.status != "ready":
+        raise APIError(
+            "REPORT_NOT_READY",
+            "Episode can only be closed once the evidence package report is ready.",
+            status_code=409,
+        )
+
+    now = datetime.now(UTC)
+    case.status = "closed"
+    case.closed_at = now
+    case.resolution_notes = notes
+    case.revision += 1
+
+    session.add(
+        AuditEvent(
+            actor_user_id=profile.auth_user_id,
+            action="response_case.closed",
+            entity_type="response_case",
+            entity_id=str(case.id),
+            details={"resolution_notes": notes, "report_id": str(report.id)},
+        )
+    )
+    await session.commit()
+    await session.refresh(case)
+    return {"id": str(case.id), "status": case.status, "revision": case.revision}
+
+
+@router.post("/response-cases/{case_id}/dismiss")
+async def dismiss_response_case(
+    case_id: UUID,
+    request: ResponseCaseDismiss,
+    profile: ProfileDependency,
+    session: SessionDependency,
+    pilot: str = Query(default="jkuat"),
+) -> dict[str, Any]:
+    pilot_definition = _require_pilot(pilot)
+    case = await _owned_response_case(session, case_id, profile, pilot_definition.slug)
+    if request.revision != case.revision:
+        raise APIError(
+            "REVISION_CONFLICT",
+            "The response case was modified by another session. Refresh before saving.",
+            status_code=409,
+            details={"current_revision": case.revision},
+        )
+    if case.status == "closed":
+        raise APIError(
+            "CANNOT_DISMISS_CLOSED", "Closed episodes cannot be dismissed.", status_code=409
+        )
+
+    reason = request.reason.strip()
+    if not reason:
+        raise APIError(
+            "DISMISSAL_REASON_REQUIRED", "Dismissal reason is required.", status_code=422
+        )
+
+    now = datetime.now(UTC)
+    case.status = "dismissed"
+    case.dismissed_at = now
+    case.dismissal_reason = reason
+    case.revision += 1
+
+    mission = await session.get(Mission, case.mission_id)
+    if mission and mission.status not in {"completed", "cancelled"}:
+        mission.status = "cancelled"
+        mission.revision += 1
+
+    session.add(
+        AuditEvent(
+            actor_user_id=profile.auth_user_id,
+            action="response_case.dismissed",
+            entity_type="response_case",
+            entity_id=str(case.id),
+            details={"reason": reason},
+        )
+    )
+    await session.commit()
+    await session.refresh(case)
+    return {"id": str(case.id), "status": case.status, "revision": case.revision}
+
+
+@router.post("/response-cases/{case_id}/updates")
+async def create_response_update(
+    case_id: UUID,
+    request: ResponseUpdateCreate,
+    profile: ProfileDependency,
+    session: SessionDependency,
+    pilot: str = Query(default="jkuat"),
+) -> dict[str, Any]:
+    pilot_definition = _require_pilot(pilot)
+    case = await _owned_response_case(session, case_id, profile, pilot_definition.slug)
+    if case.status in {"closed", "dismissed"}:
+        raise APIError(
+            "CASE_TERMINATED",
+            "Updates cannot be logged on closed or dismissed episodes.",
+            status_code=409,
+        )
+
+    point = Point(request.longitude, request.latitude)
+    if not pilot_definition.boundary.covers(point):
+        raise APIError(
+            "OUTSIDE_PILOT",
+            "The GPS coordinates are outside the pilot boundary.",
+            status_code=422,
+        )
+
+    update = ResponseUpdate(
+        response_case_id=case.id,
+        author_user_id=profile.auth_user_id,
+        notes=request.notes.strip(),
+        geom=from_shape(point, srid=4326),
+    )
+    session.add(update)
+    await session.flush()
+
+    session.add(
+        AuditEvent(
+            actor_user_id=profile.auth_user_id,
+            action="response_update.created",
+            entity_type="response_update",
+            entity_id=str(update.id),
+            details={"case_id": str(case.id), "notes": update.notes},
+        )
+    )
+    await session.commit()
+    await session.refresh(update)
+    return {
+        "id": str(update.id),
+        "case_id": str(case.id),
+        "notes": update.notes,
+        "latitude": request.latitude,
+        "longitude": request.longitude,
+        "created_at": update.created_at,
+    }
+
+
+@router.post("/response-updates/{update_id}/attachments")
+async def upload_response_attachment(
+    update_id: UUID,
+    profile: ProfileDependency,
+    session: SessionDependency,
+    settings: SettingsDependency,
+    file: UploadFile = File(),
+) -> dict[str, Any]:
+    update = await session.get(ResponseUpdate, update_id)
+    if update is None:
+        raise APIError("UPDATE_NOT_FOUND", "Update not found.", status_code=404)
+    case = await session.get(ResponseCase, update.response_case_id)
+    if case is None or (case.owner_user_id != profile.auth_user_id and not profile.is_system_owner):
+        raise APIError("OWNERSHIP_REQUIRED", "Access denied.", status_code=403)
+    if case.status in {"closed", "dismissed"}:
+        raise APIError(
+            "CASE_TERMINATED",
+            "Attachments cannot be added to closed or dismissed episodes.",
+            status_code=409,
+        )
+
+    count = (
+        await session.execute(
+            select(func.count())
+            .select_from(ResponseAttachment)
+            .where(ResponseAttachment.update_id == update.id)
+        )
+    ).scalar_one()
+    if count >= 3:
+        raise APIError(
+            "ATTACHMENT_LIMIT",
+            "An update can contain at most three photos.",
+            status_code=422,
+        )
+
+    payload = await file.read()
+    if len(payload) > 8 * 1024 * 1024:
+        raise APIError("FILE_TOO_LARGE", "Photos are limited to 8 MB.", status_code=413)
+    if file.content_type not in {"image/jpeg", "image/png", "image/webp"}:
+        raise APIError("UNSUPPORTED_MEDIA_TYPE", "Use JPEG, PNG or WebP photos.", status_code=415)
+
+    try:
+        image = Image.open(io.BytesIO(payload))
+        image.thumbnail((2400, 2400))
+        if image.mode not in {"RGB", "RGBA"}:
+            image = image.convert("RGB")
+        output = io.BytesIO()
+        # Save stripping all metadata
+        image.save(output, "WEBP", quality=88, method=6)
+        normalized = output.getvalue()
+    except (UnidentifiedImageError, OSError) as exc:
+        raise APIError(
+            "INVALID_IMAGE", "The uploaded photo cannot be decoded.", status_code=422
+        ) from exc
+
+    checksum = hashlib.sha256(normalized).hexdigest()
+    object_key = f"{profile.auth_user_id}/{case.id}/{update.id}/{uuid.uuid4()}.webp"
+    await ObjectStorage(settings).put(
+        settings.response_evidence_bucket, object_key, normalized, "image/webp"
+    )
+
+    attachment = ResponseAttachment(
+        update_id=update.id,
+        object_key=object_key,
+        original_filename=(file.filename or "response-photo")[:255],
+        content_type="image/webp",
+        size_bytes=len(normalized),
+        checksum=checksum,
+    )
+    session.add(attachment)
+    await session.commit()
+    await session.refresh(attachment)
+    return {
+        "id": str(attachment.id),
+        "content_type": attachment.content_type,
+        "size_bytes": attachment.size_bytes,
+    }
+
+
+@router.get("/response-attachments/{attachment_id}/download")
+async def download_response_attachment(
+    attachment_id: UUID,
+    profile: ProfileDependency,
+    session: SessionDependency,
+    settings: SettingsDependency,
+) -> Any:
+    attachment = await session.get(ResponseAttachment, attachment_id)
+    if attachment is None:
+        raise APIError("ATTACHMENT_NOT_FOUND", "Attachment not found.", status_code=404)
+    update = await session.get(ResponseUpdate, attachment.update_id)
+    if update is None:
+        raise APIError("ATTACHMENT_NOT_FOUND", "Update not found.", status_code=404)
+    case = await session.get(ResponseCase, update.response_case_id)
+    if case is None or (case.owner_user_id != profile.auth_user_id and not profile.is_system_owner):
+        raise APIError("OWNERSHIP_REQUIRED", "Access denied.", status_code=403)
+
+    storage = ObjectStorage(settings)
+    signed_url = await storage.signed_url(
+        settings.response_evidence_bucket, attachment.object_key
+    )
+    if signed_url:
+        return RedirectResponse(signed_url, status_code=307)
+    path = storage.local_path(settings.response_evidence_bucket, attachment.object_key)
+    if not path.exists():
+        raise APIError("FILE_MISSING", "Attachment file not found on storage.", status_code=404)
+    return FileResponse(
+        path,
+        media_type=attachment.content_type,
+        filename=attachment.original_filename,
+    )
+
+
+@router.post("/response-cases/{case_id}/report/retry")
+async def retry_response_case_report(
+    case_id: UUID,
+    profile: ProfileDependency,
+    session: SessionDependency,
+    pilot: str = Query(default="jkuat"),
+) -> dict[str, Any]:
+    pilot_definition = _require_pilot(pilot)
+    case = await _owned_response_case(session, case_id, profile, pilot_definition.slug)
+    report = (
+        await session.execute(
+            select(ReportRun)
+            .where(ReportRun.mission_id == case.mission_id)
+            .order_by(ReportRun.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+    if report is None:
+        mission = await session.get(Mission, case.mission_id)
+        report = ReportRun(
+            pilot_slug=case.pilot_slug,
+            owner_user_id=case.owner_user_id,
+            mission_id=case.mission_id,
+            status="queued",
+            parameters={"title": f"Evidence: {mission.title if mission else 'Response mission'}"},
+        )
+        session.add(report)
+        await session.flush()
+    else:
+        report.status = "queued"
+        report.error_message = None
+
+    dispatch_report(str(report.id))
+    await session.commit()
+    return {"report_id": str(report.id), "status": report.status}
+

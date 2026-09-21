@@ -94,6 +94,8 @@ class AlertRuleCreate(BaseModel):
     cooldown_minutes: int = Field(default=180, ge=15, le=10_080)
     channels: list[Literal["in_app", "email"]] = Field(default_factory=lambda: ["in_app"])
     enabled: bool = True
+    severity: Literal["advisory", "warning", "critical"] = "warning"
+    response_mode: Literal["notify_only", "case_and_mission"] = "case_and_mission"
 
     @model_validator(mode="after")
     def validate_threshold(self) -> AlertRuleCreate:
@@ -120,6 +122,41 @@ class AlertRulePatch(BaseModel):
     cooldown_minutes: int | None = Field(default=None, ge=15, le=10_080)
     channels: list[Literal["in_app", "email"]] | None = None
     enabled: bool | None = None
+    severity: Literal["advisory", "warning", "critical"] | None = None
+    response_mode: Literal["notify_only", "case_and_mission"] | None = None
+
+
+class ResponseCaseAcknowledge(BaseModel):
+    revision: int
+
+
+class ResponseCaseRoute(BaseModel):
+    route_id: UUID
+    revision: int
+
+
+class ResponseCaseStart(BaseModel):
+    revision: int
+
+
+class ResponseCaseComplete(BaseModel):
+    revision: int
+
+
+class ResponseCaseClose(BaseModel):
+    resolution_notes: str = Field(min_length=3)
+    revision: int
+
+
+class ResponseCaseDismiss(BaseModel):
+    reason: str = Field(min_length=3)
+    revision: int
+
+
+class ResponseUpdateCreate(BaseModel):
+    notes: str = Field(min_length=1)
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
 
 
 class MemberPatch(BaseModel):
@@ -130,3 +167,4 @@ class DataSourcePatch(BaseModel):
     enabled: bool | None = None
     schedule: str | None = Field(default=None, max_length=96)
     mapping: dict[str, Any] | None = None
+

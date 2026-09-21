@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     resend_api_key: str = ""
     email_from: str = "SolarShepherd <no-reply@example.com>"
     sample_evidence_bucket: str = "sample-evidence"
+    response_evidence_bucket: str = "response-evidence"
     reports_bucket: str = "reports"
     signed_url_ttl_seconds: int = 300
     local_storage_path: str = "/data/operational"

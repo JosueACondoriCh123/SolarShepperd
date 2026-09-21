@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from operator import ge, gt, le, lt
@@ -13,15 +14,100 @@ from app.config import Settings
 from app.models import (
     Alert,
     AlertRule,
+    AuditEvent,
     ForecastPoint,
     ForecastRun,
     Mission,
     NotificationDelivery,
+    ResponseCase,
     TelemetryObservation,
     UserProfile,
 )
 
 COMPARATORS: dict[str, Callable[[float, float], bool]] = {">": gt, ">=": ge, "<": lt, "<=": le}
+
+
+async def _ensure_response_case(
+    session: AsyncSession,
+    rule: AlertRule,
+    alert_title: str,
+    alert_message: str,
+    payload: dict[str, object],
+    now: datetime,
+) -> uuid.UUID:
+    case_stmt = (
+        select(ResponseCase)
+        .where(
+            ResponseCase.rule_id == rule.id,
+            ResponseCase.owner_user_id == rule.owner_user_id,
+            ResponseCase.pilot_slug == rule.pilot_slug,
+            ResponseCase.status.in_(["triage", "ready", "responding", "review"]),
+        )
+        .order_by(ResponseCase.created_at.desc())
+        .limit(1)
+    )
+    case = (await session.execute(case_stmt)).scalar_one_or_none()
+    if case is not None:
+        return case.id
+
+    scheduled_start: datetime = now
+    if rule.kind == "forecast_threshold" and payload.get("valid_at"):
+        try:
+            val = payload["valid_at"]
+            if isinstance(val, str):
+                scheduled_start = datetime.fromisoformat(val)
+            elif isinstance(val, datetime):
+                scheduled_start = val
+        except (ValueError, TypeError):
+            scheduled_start = now
+
+    mission = Mission(
+        id=uuid.uuid4(),
+        pilot_slug=rule.pilot_slug,
+        owner_user_id=rule.owner_user_id,
+        title=f"Response: {rule.name}",
+        description=f"Automated response mission for alert '{alert_title}'. {alert_message}",
+        status="planned",
+        scheduled_start=scheduled_start,
+        scheduled_end=scheduled_start + timedelta(hours=2),
+        route_run_id=None,
+        notes=(
+            f"Automated response mission for rule {rule.name} ({rule.kind}). "
+            "Route must be assigned via Response Center."
+        ),
+        revision=1,
+    )
+    session.add(mission)
+    await session.flush()
+
+    new_case = ResponseCase(
+        id=uuid.uuid4(),
+        pilot_slug=rule.pilot_slug,
+        owner_user_id=rule.owner_user_id,
+        rule_id=rule.id,
+        mission_id=mission.id,
+        status="triage",
+        severity=rule.severity or "warning",
+        revision=1,
+    )
+    session.add(new_case)
+    await session.flush()
+
+    session.add(
+        AuditEvent(
+            actor_user_id=rule.owner_user_id,
+            action="response_case_created",
+            entity_type="response_case",
+            entity_id=str(new_case.id),
+            details={
+                "rule_id": str(rule.id),
+                "mission_id": str(mission.id),
+                "status": "triage",
+                "severity": new_case.severity,
+            },
+        )
+    )
+    return new_case.id
 
 
 async def evaluate_alert_rules(session: AsyncSession, settings: Settings) -> int:
@@ -44,6 +130,16 @@ async def evaluate_alert_rules(session: AsyncSession, settings: Settings) -> int
             continue
         title, message, payload, bucket = result
         dedupe_key = f"{rule.id}:{bucket}"
+
+        response_case_id: uuid.UUID | None = None
+        if (
+            rule.kind in {"forecast_threshold", "telemetry_stale"}
+            and getattr(rule, "response_mode", "notify_only") == "case_and_mission"
+        ):
+            response_case_id = await _ensure_response_case(
+                session, rule, title, message, payload, now
+            )
+
         alert_id = (
             await session.execute(
                 insert(Alert)
@@ -51,10 +147,11 @@ async def evaluate_alert_rules(session: AsyncSession, settings: Settings) -> int
                     pilot_slug=rule.pilot_slug,
                     owner_user_id=rule.owner_user_id,
                     rule_id=rule.id,
+                    response_case_id=response_case_id,
                     kind=rule.kind,
                     title=title,
                     message=message,
-                    severity="warning",
+                    severity=getattr(rule, "severity", "warning") or "warning",
                     payload=payload,
                     dedupe_key=dedupe_key,
                 )
@@ -68,9 +165,31 @@ async def evaluate_alert_rules(session: AsyncSession, settings: Settings) -> int
         created += 1
         if "email" in rule.channels:
             session.add(NotificationDelivery(alert_id=alert_id, channel="email", status="pending"))
+
+    # Reconcile unlinked alerts for rules that require case_and_mission
+    unlinked_alerts = list(
+        (
+            await session.execute(
+                select(Alert, AlertRule)
+                .join(AlertRule, Alert.rule_id == AlertRule.id)
+                .where(
+                    Alert.response_case_id.is_(None),
+                    AlertRule.response_mode == "case_and_mission",
+                    AlertRule.kind.in_(["forecast_threshold", "telemetry_stale"]),
+                )
+            )
+        ).all()
+    )
+    for alert, rule in unlinked_alerts:
+        case_id = await _ensure_response_case(
+            session, rule, alert.title, alert.message, alert.payload, alert.created_at
+        )
+        alert.response_case_id = case_id
+
     await session.commit()
     await deliver_pending_emails(session, settings)
     return created
+
 
 
 async def _evaluate_rule(

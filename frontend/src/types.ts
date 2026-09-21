@@ -313,6 +313,7 @@ export interface Mission {
   started_at: string | null;
   completed_at: string | null;
   sample_count?: number;
+  response_case_id?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -368,6 +369,8 @@ export interface AlertRule {
   cooldown_minutes: number;
   channels: ("in_app" | "email")[];
   enabled: boolean;
+  severity: "advisory" | "warning" | "critical";
+  response_mode: "notify_only" | "case_and_mission";
   last_triggered_at: string | null;
 }
 
@@ -376,8 +379,81 @@ export interface UserAlert {
   kind: string;
   title: string;
   message: string;
-  severity: string;
+  severity: "advisory" | "warning" | "critical" | string;
   payload: Record<string, unknown>;
+  response_case_id?: string | null;
   created_at: string;
   acknowledged_at: string | null;
+}
+
+export interface ResponseAttachment {
+  id: string;
+  update_id: string;
+  original_filename: string;
+  content_type: string;
+  size_bytes: number;
+  created_at: string;
+}
+
+export interface ResponseUpdate {
+  id: string;
+  response_case_id: string;
+  author_user_id: string;
+  author_name?: string;
+  notes: string;
+  latitude: number;
+  longitude: number;
+  created_at: string;
+  attachments: ResponseAttachment[];
+}
+
+export interface ResponseNextAction {
+  stage: "Detect" | "Verify" | "Route" | "Respond" | "Prove";
+  action:
+    | "acknowledge"
+    | "route"
+    | "start"
+    | "complete"
+    | "waiting_report"
+    | "retry_report"
+    | "close"
+    | "none";
+  label: string;
+  description: string;
+}
+
+export interface ResponseCaseSummary {
+  id: string;
+  pilot_slug: string;
+  owner_user_id: string;
+  rule_id: string | null;
+  rule_name: string | null;
+  mission_id: string;
+  mission_title: string | null;
+  mission_status: "draft" | "planned" | "active" | "completed" | "cancelled" | null;
+  status: "triage" | "ready" | "responding" | "review" | "closed" | "dismissed";
+  severity: "advisory" | "warning" | "critical";
+  revision: number;
+  resolution_notes: string | null;
+  dismissal_reason: string | null;
+  acknowledged_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  closed_at: string | null;
+  dismissed_at: string | null;
+  created_at: string;
+  updated_at: string;
+  alert_count: number;
+  update_count: number;
+  route_run_id: string | null;
+}
+
+export interface ResponseCaseDetail extends ResponseCaseSummary {
+  alerts: UserAlert[];
+  updates: ResponseUpdate[];
+  mission: Mission | null;
+  route: RouteResponse | null;
+  report: MissionReport | null;
+  next_action: ResponseNextAction;
+  timeline: TimelineEvent[];
 }
