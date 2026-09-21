@@ -4,7 +4,7 @@ import hashlib
 import io
 import secrets
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -320,6 +320,350 @@ async def dashboard(
         "active_mission": _mission(mission) if mission else None,
         "pending_samples": pending_samples,
         "unread_alerts": unread_alerts,
+        "calibration_status": "CALIBRATION_REQUIRED",
+    }
+
+
+def _field_flow_stage(
+    key: str,
+    label: str,
+    status: Literal["ready", "current", "attention", "blocked"],
+    summary: str,
+    evidence_at: datetime | None = None,
+) -> dict[str, Any]:
+    return {
+        "key": key,
+        "label": label,
+        "status": status,
+        "summary": summary,
+        "evidence_at": evidence_at,
+    }
+
+
+@router.get("/field-flow")
+async def field_flow(
+    principal: PrincipalDependency,
+    session: SessionDependency,
+    pilot: str = "jkuat",
+    mission_id: UUID | None = None,
+) -> dict[str, Any]:
+    """Build one deterministic evidence-to-report workflow from persisted records."""
+    pilot_definition = _require_pilot(pilot)
+    now = datetime.now(UTC)
+
+    telemetry = (
+        await session.execute(
+            select(TelemetryObservation)
+            .where(TelemetryObservation.pilot_slug == pilot_definition.slug)
+            .order_by(TelemetryObservation.observed_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    forecast = (
+        await session.execute(
+            select(ForecastRun)
+            .where(ForecastRun.pilot_slug == pilot_definition.slug)
+            .order_by(ForecastRun.fetched_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    scene = (
+        await session.execute(
+            select(SatelliteScene)
+            .where(
+                func.ST_Intersects(
+                    SatelliteScene.footprint,
+                    func.ST_GeomFromText(pilot_definition.boundary.wkt, 4326),
+                )
+            )
+            .order_by(SatelliteScene.acquired_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+    mission: Mission | None = None
+    if mission_id is not None:
+        if principal.is_guest:
+            raise APIError("FORBIDDEN", "Guest sessions cannot open missions.", status_code=403)
+        mission = await session.get(Mission, mission_id)
+        if (
+            mission is None
+            or mission.pilot_slug != pilot_definition.slug
+            or (
+                mission.owner_user_id != principal.user_id
+                and not principal.is_system_owner
+            )
+        ):
+            raise APIError("OWNERSHIP_REQUIRED", "Mission not found.", status_code=404)
+    elif not principal.is_guest:
+        mission = (
+            await session.execute(
+                select(Mission)
+                .where(
+                    Mission.owner_user_id == principal.user_id,
+                    Mission.pilot_slug == pilot_definition.slug,
+                    Mission.status.in_(["active", "planned", "draft"]),
+                )
+                .order_by(
+                    (Mission.status == "active").desc(),
+                    (Mission.status == "planned").desc(),
+                    Mission.scheduled_start.asc().nullslast(),
+                    Mission.created_at.desc(),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+    route: RouteRun | None = None
+    if mission and mission.route_run_id:
+        route = await session.get(RouteRun, mission.route_run_id)
+    elif not principal.is_guest:
+        route = (
+            await session.execute(
+                select(RouteRun)
+                .where(
+                    RouteRun.owner_user_id == principal.user_id,
+                    RouteRun.pilot_slug == pilot_definition.slug,
+                    RouteRun.status == "complete",
+                )
+                .order_by(RouteRun.requested_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+    sample_counts = {"draft": 0, "pending_review": 0, "approved": 0, "rejected": 0}
+    report: ReportRun | None = None
+    if mission:
+        rows = (
+            await session.execute(
+                select(SampleSubmission.status, func.count())
+                .where(SampleSubmission.mission_id == mission.id)
+                .group_by(SampleSubmission.status)
+            )
+        ).all()
+        sample_counts.update({str(status): int(count) for status, count in rows})
+        report = (
+            await session.execute(
+                select(ReportRun)
+                .where(
+                    ReportRun.mission_id == mission.id,
+                    ReportRun.owner_user_id == mission.owner_user_id,
+                )
+                .order_by(ReportRun.created_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+    telemetry_age = (
+        max(0.0, (now - telemetry.observed_at).total_seconds()) if telemetry else None
+    )
+    telemetry_fresh = telemetry_age is not None and telemetry_age <= timedelta(hours=6).total_seconds()
+    forecast_current = bool(forecast and forecast.valid_from <= now <= forecast.valid_to)
+    scene_usable = bool(
+        scene
+        and scene.processing_status == "complete"
+        and (scene.valid_fraction is None or scene.valid_fraction >= 0.5)
+    )
+
+    observe_status: Literal["ready", "current", "attention", "blocked"]
+    if telemetry_fresh:
+        observe_status = "ready"
+        observe_summary = f"Fresh observation from {telemetry.source}."
+    elif telemetry:
+        observe_status = "attention"
+        observe_summary = "The latest observation is stale; forecast remains separate."
+    elif forecast_current:
+        observe_status = "attention"
+        observe_summary = "No station observation; only modelled outlook is available."
+    else:
+        observe_status = "blocked"
+        observe_summary = "No current weather evidence is available."
+
+    if scene_usable:
+        landscape_status: Literal["ready", "current", "attention", "blocked"] = "ready"
+        landscape_summary = "A processed Sentinel-2 surface is available."
+    elif scene:
+        landscape_status = "attention"
+        landscape_summary = "A scene exists but processing or valid coverage is incomplete."
+    else:
+        landscape_status = "blocked"
+        landscape_summary = "No Sentinel-2 scene has been persisted for this pilot."
+
+    route_attached = bool(mission and mission.route_run_id and route)
+    if route_attached:
+        route_status: Literal["ready", "current", "attention", "blocked"] = "ready"
+        route_summary = "A versioned evidence route is attached to the mission."
+    elif route:
+        route_status = "current"
+        route_summary = "A saved route is ready to attach to the mission."
+    else:
+        route_status = "blocked"
+        route_summary = "No saved terrain route is available yet."
+
+    if mission is None:
+        mission_status: Literal["ready", "current", "attention", "blocked"] = "blocked"
+        mission_summary = "Create a mission to preserve decisions and field activity."
+    elif mission.status == "draft":
+        mission_status = "current"
+        mission_summary = "Mission brief exists and is ready to be planned."
+    elif mission.status in {"planned", "active", "completed"}:
+        mission_status = "ready"
+        mission_summary = f"Mission is {mission.status}."
+    else:
+        mission_status = "attention"
+        mission_summary = f"Mission is {mission.status}; choose another mission to continue."
+
+    if report and report.status == "ready":
+        proof_status: Literal["ready", "current", "attention", "blocked"] = "ready"
+        proof_summary = "The immutable PDF and JSON evidence package is ready."
+    elif report and report.status in {"queued", "processing"}:
+        proof_status = "current"
+        proof_summary = "The evidence package is being generated."
+    elif mission and mission.status == "completed":
+        proof_status = "current"
+        proof_summary = "Field work is complete; generate its evidence package."
+    elif mission:
+        proof_status = "attention"
+        proof_summary = "Capture field evidence and complete the mission before reporting."
+    else:
+        proof_status = "blocked"
+        proof_summary = "A mission is required before evidence can be packaged."
+
+    if principal.is_guest:
+        next_action = {
+            "key": "explore_route",
+            "label": "Explore an evidence route",
+            "reason": "Guest mode can inspect shared evidence but cannot persist field work.",
+            "section": "routes",
+        }
+    elif mission is None and route is None:
+        next_action = {
+            "key": "plan_route",
+            "label": "Plan the first route",
+            "reason": "A terrain-backed route creates the movement evidence for a mission.",
+            "section": "routes",
+        }
+    elif mission is None:
+        next_action = {
+            "key": "create_mission",
+            "label": "Create a mission",
+            "reason": "A saved route is available and can be attached immediately.",
+            "section": "field-flow",
+        }
+    elif not route_attached:
+        next_action = {
+            "key": "attach_route" if route else "plan_route",
+            "label": "Attach the saved route" if route else "Plan a mission route",
+            "reason": "The mission needs a versioned route before field deployment.",
+            "section": "field-flow" if route else "routes",
+        }
+    elif mission.status == "draft":
+        next_action = {
+            "key": "plan_mission",
+            "label": "Mark mission as planned",
+            "reason": "The brief and route are ready for scheduling.",
+            "section": "field-flow",
+        }
+    elif mission.status == "planned":
+        next_action = {
+            "key": "start_mission",
+            "label": "Start field mission",
+            "reason": "Starting creates an auditable field-work timestamp.",
+            "section": "field-flow",
+        }
+    elif mission.status == "active" and sum(sample_counts.values()) == 0:
+        next_action = {
+            "key": "capture_sample",
+            "label": "Capture field evidence",
+            "reason": "A georeferenced sample strengthens the mission record but remains optional.",
+            "section": "samples",
+        }
+    elif mission.status == "active":
+        next_action = {
+            "key": "complete_mission",
+            "label": "Complete mission",
+            "reason": "Field evidence is attached and the mission can be closed.",
+            "section": "field-flow",
+        }
+    elif mission.status == "completed" and report is None:
+        next_action = {
+            "key": "generate_report",
+            "label": "Generate evidence package",
+            "reason": "The completed mission is ready for a versioned PDF and JSON receipt.",
+            "section": "field-flow",
+        }
+    else:
+        next_action = {
+            "key": "review_report",
+            "label": "Review mission evidence",
+            "reason": "The workflow record is available for review and export.",
+            "section": "reports",
+        }
+
+    return {
+        "generated_at": now,
+        "pilot_slug": pilot_definition.slug,
+        "mission": _mission(mission, sum(sample_counts.values())) if mission else None,
+        "route": {
+            "id": str(route.id),
+            "name": route.name or f"Route {str(route.id)[:8]}",
+            "attached": route_attached,
+            "requested_at": route.requested_at,
+            "total_distance_m": route.total_distance_m,
+            "estimated_time_s": route.total_time_s,
+            "profile": route.parameters.get("profile", "resource_aware"),
+        }
+        if route
+        else None,
+        "evidence": {
+            "telemetry": {
+                "status": "healthy" if telemetry_fresh else "stale" if telemetry else "unavailable",
+                "observed_at": telemetry.observed_at if telemetry else None,
+                "source": telemetry.source if telemetry else None,
+                "station_id": telemetry.station_id if telemetry else None,
+                "quality_flags": telemetry.quality_flags if telemetry else [],
+                "age_seconds": telemetry_age,
+            },
+            "forecast": {
+                "status": "current" if forecast_current else "stale" if forecast else "unavailable",
+                "generated_at": forecast.generated_at if forecast else None,
+                "valid_to": forecast.valid_to if forecast else None,
+                "source": forecast.source if forecast else None,
+                "model": forecast.model if forecast else None,
+            },
+            "scene": {
+                "status": "ready" if scene_usable else "attention" if scene else "unavailable",
+                "id": scene.id if scene else None,
+                "acquired_at": scene.acquired_at if scene else None,
+                "source": scene.source if scene else None,
+                "valid_fraction": scene.valid_fraction if scene else None,
+            },
+        },
+        "samples": {"total": sum(sample_counts.values()), **sample_counts},
+        "report": _report(report) if report else None,
+        "stages": [
+            _field_flow_stage(
+                "sense", "Sense", observe_status, observe_summary,
+                telemetry.observed_at if telemetry else forecast.generated_at if forecast else None,
+            ),
+            _field_flow_stage(
+                "read", "Read landscape", landscape_status, landscape_summary,
+                scene.acquired_at if scene else None,
+            ),
+            _field_flow_stage(
+                "move", "Move", route_status, route_summary,
+                route.requested_at if route else None,
+            ),
+            _field_flow_stage(
+                "act", "Act", mission_status, mission_summary,
+                mission.updated_at if mission else None,
+            ),
+            _field_flow_stage(
+                "prove", "Prove", proof_status, proof_summary,
+                report.completed_at if report else None,
+            ),
+        ],
+        "next_action": next_action,
         "calibration_status": "CALIBRATION_REQUIRED",
     }
 

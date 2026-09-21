@@ -236,6 +236,69 @@ export interface DashboardData {
   calibration_status: "CALIBRATION_REQUIRED";
 }
 
+export interface FieldFlowStage {
+  key: "sense" | "read" | "move" | "act" | "prove";
+  label: string;
+  status: "ready" | "current" | "attention" | "blocked";
+  summary: string;
+  evidence_at: string | null;
+}
+
+export interface FieldFlowData {
+  generated_at: string;
+  pilot_slug: string;
+  mission: Mission | null;
+  route: {
+    id: string;
+    name: string;
+    attached: boolean;
+    requested_at: string;
+    total_distance_m: number | null;
+    estimated_time_s: number | null;
+    profile: "fastest" | "resource_aware";
+  } | null;
+  evidence: {
+    telemetry: {
+      status: "healthy" | "stale" | "unavailable";
+      observed_at: string | null;
+      source: string | null;
+      station_id: string | null;
+      quality_flags: string[];
+      age_seconds: number | null;
+    };
+    forecast: {
+      status: "current" | "stale" | "unavailable";
+      generated_at: string | null;
+      valid_to: string | null;
+      source: string | null;
+      model: string | null;
+    };
+    scene: {
+      status: "ready" | "attention" | "unavailable";
+      id: string | null;
+      acquired_at: string | null;
+      source: string | null;
+      valid_fraction: number | null;
+    };
+  };
+  samples: {
+    total: number;
+    draft: number;
+    pending_review: number;
+    approved: number;
+    rejected: number;
+  };
+  report: MissionReport | null;
+  stages: FieldFlowStage[];
+  next_action: {
+    key: string;
+    label: string;
+    reason: string;
+    section: string;
+  };
+  calibration_status: "CALIBRATION_REQUIRED";
+}
+
 export interface Mission {
   id: string;
   title: string;

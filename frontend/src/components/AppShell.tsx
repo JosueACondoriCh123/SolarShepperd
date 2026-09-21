@@ -1,5 +1,5 @@
 import {
-  Activity, Bell, ChevronRight, DatabaseZap, FileText, Gauge, Hexagon, Home,
+  Activity, Bell, ChevronRight, CircleDotDashed, DatabaseZap, FileText, Gauge, Hexagon, Home,
   LogOut, Map, MoreHorizontal, Route as RouteIcon, Settings, ShieldCheck, Sprout, Users,
 } from "lucide-react";
 import type { PropsWithChildren } from "react";
@@ -13,6 +13,7 @@ import { PilotSelector } from "./PilotSelector";
 
 const navigation = [
   { group: "Overview", section: "dashboard", label: "Dashboard", icon: Home, access: "all" },
+  { group: "Overview", section: "field-flow", label: "Field decision loop", icon: CircleDotDashed, access: "all" },
   { group: "Observe", section: "telemetry", label: "Live telemetry", icon: Activity, access: "all" },
   { group: "Observe", section: "landscape", label: "Landscape", icon: Map, access: "all" },
   { group: "Plan", section: "routes", label: "Route planner", icon: RouteIcon, access: "all" },

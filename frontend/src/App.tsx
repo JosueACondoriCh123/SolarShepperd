@@ -9,6 +9,7 @@ import { LegalPage } from "./pages/LegalPage";
 import { PilotProvider, preferredPilotSlug } from "./pilot/PilotContext";
 
 const DashboardPage = lazy(() => import("./pages/DashboardPage").then((module) => ({ default: module.DashboardPage })));
+const FieldFlowPage = lazy(() => import("./pages/FieldFlowPage").then((module) => ({ default: module.FieldFlowPage })));
 const TelemetryPage = lazy(() => import("./pages/TelemetryPage").then((module) => ({ default: module.TelemetryPage })));
 const LandscapePage = lazy(() => import("./pages/LandscapePage").then((module) => ({ default: module.LandscapePage })));
 const RoutePlannerPage = lazy(() => import("./pages/RoutePlannerPage").then((module) => ({ default: module.RoutePlannerPage })));
@@ -38,7 +39,7 @@ function ConsoleLayout() {
 
 const owner = (element: ReactNode) => <OwnerRoute>{element}</OwnerRoute>;
 const legacySections = [
-  "dashboard", "telemetry", "landscape", "routes", "capacity", "missions", "samples",
+  "dashboard", "field-flow", "telemetry", "landscape", "routes", "capacity", "missions", "samples",
   "reports", "alerts", "operations", "data-sources", "team", "settings",
 ] as const;
 
@@ -68,6 +69,7 @@ export default function App() {
       <Route path="/app/:pilotSlug" element={<ConsoleLayout />}>
         <Route index element={<Navigate to="dashboard" replace />} />
         <Route path="dashboard" element={<DashboardPage />} />
+        <Route path="field-flow" element={<FieldFlowPage />} />
         <Route path="telemetry" element={<TelemetryPage />} />
         <Route path="landscape" element={<LandscapePage />} />
         <Route path="routes" element={<RoutePlannerPage />} />
