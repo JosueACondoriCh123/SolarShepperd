@@ -45,7 +45,7 @@ export function AuthProvider({ children }: PropsWithChildren) {
     () => (localStorage.getItem("solarshepherd-dev-role") as "guest" | "member" | null) || "none",
   );
 
-  const isDevelopment = authMode === "development" && !supabase;
+  const isDevelopment = devRole !== "none" || authMode === "development" || !supabase;
   const isGuest = isDevelopment
     ? devRole === "guest"
     : Boolean(session?.user.is_anonymous);

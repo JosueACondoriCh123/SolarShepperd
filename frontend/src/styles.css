@@ -187,6 +187,7 @@ a { color: inherit; text-decoration: none; }
 .legend-ramp.elevation { background: linear-gradient(90deg,#307da9,#68a187,#947052); }
 .legend-ramp.slope { background: linear-gradient(90deg,#3d9d78,#d4b05e,#e26455); }
 .legend-ramp.delta_ndvi, .legend-ramp.delta_ndmi { background: linear-gradient(90deg,#dc503b,#f2ead5,#54b96d); }
+.legend-ramp.biomass { background: linear-gradient(90deg,#d4b05e,#84b868,#2d7a46); }
 .map-provenance { display: flex; flex-direction: column; gap: 4px; margin-top: 13px; padding: 9px; background: var(--paper-2); border: 1px dashed var(--ink); font-size: 7px; line-height: 1.35; }
 .map-provenance strong { font-size: 8px; text-transform: uppercase; }
 .map-stage, .route-map { position: relative; overflow: hidden; min-height: 590px; background: #cfe3c7; }
@@ -807,10 +808,72 @@ a { color: inherit; text-decoration: none; }
 .alert-case-button { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; background: var(--lime); border: 1px solid var(--ink); font-size: 9px; font-weight: 900; text-transform: uppercase; }
 .rule-mode-tag { font-weight: 900; color: var(--ink); }
 
+/* Calibration Gate & GCH Workflow */
+.calibration-stepper { margin-bottom: 20px; padding: 18px; }
+.stepper-track { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
+.stepper-step { display: flex; align-items: flex-start; gap: 10px; padding: 10px; background: var(--paper-2); border: 2px solid var(--ink); opacity: 0.65; }
+.stepper-step.complete { background: var(--paper); border-color: var(--ink); opacity: 0.92; }
+.stepper-step.current { background: var(--paper); border: 2px solid var(--ink); box-shadow: 3px 3px 0 var(--ink); opacity: 1; }
+.step-badge { display: grid; width: 24px; height: 24px; place-items: center; background: var(--paper-2); border: 1px solid var(--ink); font-size: 10px; font-weight: 900; flex-shrink: 0; }
+.stepper-step.complete .step-badge { background: var(--green); color: #fff; }
+.stepper-step.current .step-badge { background: var(--amber); }
+.step-content { min-width: 0; }
+.step-kicker { display: block; font-size: 7px; font-weight: 800; text-transform: uppercase; color: var(--muted); }
+.step-content strong { display: block; font-size: 10px; margin: 2px 0; }
+.step-content small { display: block; font-size: 8px; color: var(--muted); line-height: 1.3; }
+
+.calibration-hero.ready { background: #b8e6c4; }
+.calibration-lock.unlocked { background: var(--green); color: #fff; }
+.active-formula-chip { margin-top: 10px; }
+.active-formula-chip code { padding: 5px 9px; background: var(--paper); border: 1px solid var(--ink); font-size: 10px; font-weight: 800; box-shadow: 2px 2px 0 var(--ink); }
+
+.models-panel { padding: 20px; margin-top: 16px; }
+.models-panel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+.fit-model-box { padding: 16px; background: var(--paper-2); border: 2px solid var(--ink); margin-bottom: 18px; }
+.fit-form-grid { display: grid; grid-template-columns: 1fr 1.5fr auto; gap: 12px; align-items: flex-end; }
+.fit-form-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 8px; font-weight: 900; text-transform: uppercase; }
+.fit-form-grid select, .fit-form-grid input { padding: 8px; background: #fff; border: 2px solid var(--ink); font-size: 9px; }
+
+.models-list { display: flex; flex-direction: column; gap: 10px; }
+.model-card { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 14px; padding: 12px 14px; background: var(--paper-2); border: 2px solid var(--ink); }
+.model-card.active { background: var(--paper); border: 2px solid var(--ink); box-shadow: 3px 3px 0 var(--ink); }
+.model-card-header { display: flex; align-items: center; gap: 10px; }
+.model-card-header h3 { margin: 0; font-size: 11px; font-weight: 900; }
+.model-card-metrics { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; font-size: 9px; }
+.model-card-metrics span { background: #fff; padding: 2px 6px; border: 1px solid var(--ink); }
+.model-card-actions { display: flex; align-items: center; gap: 8px; }
+
+.gch-panel { padding: 20px; margin-top: 16px; }
+.gch-calc-grid { display: grid; grid-template-columns: minmax(280px, 1fr) minmax(0, 1.8fr); gap: 20px; align-items: start; }
+.gch-form { display: flex; flex-direction: column; gap: 14px; padding: 16px; background: var(--paper-2); border: 2px solid var(--ink); }
+.gch-form label { display: flex; flex-direction: column; gap: 4px; font-size: 8px; font-weight: 900; text-transform: uppercase; }
+.gch-form input[type="number"], .gch-form input[type="range"] { padding: 8px; background: #fff; border: 2px solid var(--ink); font-size: 10px; }
+.gch-form small { color: var(--muted); font-size: 8px; }
+.gch-results-wrap { display: flex; flex-direction: column; gap: 14px; }
+.gch-hero-card { padding: 18px; text-align: center; border: 3px solid var(--ink); box-shadow: 4px 4px 0 var(--ink); }
+.gch-hero-card.sustainable { background: #b8e6c4; }
+.gch-hero-card.moderate { background: var(--amber); }
+.gch-hero-card.critical { background: var(--danger); color: #fff; }
+.gch-hero-card.critical p { color: #fff; }
+.gch-days-number { font-family: "Arial Black", "Cascadia Mono", monospace; font-size: 44px; line-height: 1; margin: 8px 0; }
+.gch-metrics-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.gch-metric-box { padding: 9px; background: var(--paper-2); border: 2px solid var(--ink); }
+.gch-metric-box span { display: block; font-size: 7px; text-transform: uppercase; font-weight: 800; color: var(--muted); }
+.gch-metric-box strong { display: block; font-family: "Arial Black", "Cascadia Mono", monospace; font-size: 14px; margin-top: 3px; }
+.calibration-notice.success { display: flex; flex-direction: column; gap: 4px; margin-top: 12px; padding: 10px; background: #b8e6c4; border: 2px solid var(--ink); font-size: 8px; }
+.calibration-notice.success strong { font-size: 9px; text-transform: uppercase; }
+
+
+
 @media (max-width: 850px) {
   .response-stepper { grid-template-columns: 1fr; }
   .response-detail-grid { grid-template-columns: 1fr; }
   .next-action-banner { grid-template-columns: 1fr; }
+  .gch-calc-grid { grid-template-columns: 1fr; }
+  .stepper-track { grid-template-columns: 1fr; }
+  .gch-metrics-grid { grid-template-columns: 1fr 1fr; }
+  .fit-form-grid { grid-template-columns: 1fr; }
+  .model-card { grid-template-columns: 1fr; }
 }
 
 @media (prefers-reduced-motion: reduce) {

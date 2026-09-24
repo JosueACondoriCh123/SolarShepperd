@@ -154,15 +154,15 @@ def dispatch_ingestion(
     pilot_slug: str = "jkuat",
 ) -> AsyncResult[Any]:
     if source == "conduit":
-        return run_conduit_ingestion.delay(from_date, to_date)
+        return run_conduit_ingestion.apply_async(args=(from_date, to_date), retry=False)
     if source == "satellite":
-        return run_satellite_ingestion.delay(pilot_slug)
+        return run_satellite_ingestion.apply_async(args=(pilot_slug,), retry=False)
     if source == "terrain":
-        return run_terrain_ingestion.delay(pilot_slug)
+        return run_terrain_ingestion.apply_async(args=(pilot_slug,), retry=False)
     if source == "osm":
-        return run_osm_ingestion.delay(pilot_slug)
+        return run_osm_ingestion.apply_async(args=(pilot_slug,), retry=False)
     if source == "forecast":
-        return run_forecast_ingestion.delay(pilot_slug)
+        return run_forecast_ingestion.apply_async(args=(pilot_slug,), retry=False)
     if source == "aviation_weather":
-        return run_public_observation_ingestion.delay(pilot_slug)
+        return run_public_observation_ingestion.apply_async(args=(pilot_slug,), retry=False)
     raise ValueError(f"unsupported ingestion source: {source}")

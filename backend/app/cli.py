@@ -49,13 +49,28 @@ def main() -> int:
     import_parser = subparsers.add_parser(
         "import-geocsv", description="Import verified JKUAT FEWSNET GeoCSV observations"
     )
-    import_parser.add_argument("paths", nargs="+", type=Path)
+    import_parser.add_argument("paths", nargs="*", type=Path, default=[])
     args = parser.parse_args()
     if args.command == "import-geocsv":
-        missing = [str(path) for path in args.paths if not path.is_file()]
+        paths = list(args.paths)
+        if not paths:
+            candidates = [
+                Path("data"),
+                Path("backend/data"),
+                Path(__file__).resolve().parents[2] / "data",
+            ]
+            for candidate in candidates:
+                if candidate.is_dir():
+                    csvs = sorted(candidate.glob("*.csv"))
+                    if csvs:
+                        paths = csvs
+                        break
+        missing = [str(path) for path in paths if not path.is_file()]
         if missing:
             parser.error(f"files not found: {', '.join(missing)}")
-        return asyncio.run(_import_geocsv(args.paths))
+        if not paths:
+            parser.error("no GeoCSV datasets found in data/ or backend/data/")
+        return asyncio.run(_import_geocsv(paths))
     return 2
 
 

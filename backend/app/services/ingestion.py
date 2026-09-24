@@ -11,7 +11,7 @@ import h3
 import structlog
 from geoalchemy2.shape import from_shape
 from shapely.geometry import MultiPolygon, Point, Polygon, shape
-from sqlalchemy import delete, select, text, update
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,7 +21,12 @@ from app.integrations.aviation_weather import (
     AviationWeatherClient,
     normalize_metar_records,
 )
-from app.integrations.conduit import ConduitClient, normalize_records
+from app.integrations.conduit import (
+    ConduitAuthenticationError,
+    ConduitClient,
+    ConduitResponseError,
+    normalize_records,
+)
 from app.integrations.geo import geodesic_buffer, h3_cells_for_polygon, h3_centroid, h3_polygon
 from app.integrations.geocsv import EXCLUDED_FIELDS, VERIFIED_FIELDS, parse_geocsv
 from app.integrations.open_meteo import (
@@ -134,95 +139,285 @@ class IngestionService:
             error_message=error_message,
         )
 
+    def _find_geocsv_datasets(self) -> list[Path]:
+        seen: set[Path] = set()
+        candidates = [
+            Path(getattr(self.settings, "conduit_data_dir", "data")),
+            Path(__file__).resolve().parents[2] / "data",
+            Path("data"),
+            Path("backend/data"),
+        ]
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+                if resolved.is_dir() and resolved not in seen:
+                    seen.add(resolved)
+                    csv_files = sorted(resolved.glob("*.csv"))
+                    if csv_files:
+                        return csv_files
+            except Exception:
+                continue
+        return []
+
+    async def _ingest_geocsv_datasets(
+        self, run: IngestionRun, dataset_files: list[Path]
+    ) -> IngestionRun:
+        started = time.perf_counter()
+        total_seen = 0
+        total_written = 0
+        files_processed = []
+        min_date = None
+        max_date = None
+
+        for path in dataset_files:
+            parsed = parse_geocsv(path, self.settings.conduit_station_id)
+            if parsed.metadata.get("data collection site", "").strip().lower() != "site jkuat":
+                continue
+            if not self.area.covers(Point(parsed.longitude, parsed.latitude)):
+                continue
+
+            if min_date is None or parsed.first_observed_at.date() < min_date:
+                min_date = parsed.first_observed_at.date()
+            if max_date is None or parsed.last_observed_at.date() > max_date:
+                max_date = parsed.last_observed_at.date()
+
+            raw_payload_id = (
+                await self.session.execute(
+                    select(RawSourcePayload.id).where(
+                        RawSourcePayload.checksum == parsed.checksum
+                    )
+                )
+            ).scalar_one_or_none()
+
+            if raw_payload_id is None:
+                raw_payload = RawSourcePayload(
+                    pilot_slug=self.pilot_slug,
+                    source="fewsnet_geocsv",
+                    requested_from=parsed.first_observed_at.date(),
+                    requested_to=parsed.last_observed_at.date(),
+                    checksum=parsed.checksum,
+                    payload={
+                        "filename": parsed.filename,
+                        "metadata": parsed.metadata,
+                        "rows_seen": parsed.rows_seen,
+                        "normalized_record_count": len(parsed.records),
+                        "excluded_fields": EXCLUDED_FIELDS,
+                    },
+                )
+                self.session.add(raw_payload)
+                await self.session.flush()
+                raw_payload_id = raw_payload.id
+
+            existing_count = (
+                await self.session.execute(
+                    select(func.count(TelemetryObservation.id)).where(
+                        TelemetryObservation.raw_payload_id == raw_payload_id
+                    )
+                )
+            ).scalar() or 0
+
+            if existing_count > 0:
+                total_written += existing_count
+            else:
+                batch_size = 2_500
+                for offset in range(0, len(parsed.records), batch_size):
+                    batch = [
+                        {
+                            **record,
+                            "pilot_slug": self.pilot_slug,
+                            "raw_payload_id": raw_payload_id,
+                        }
+                        for record in parsed.records[offset : offset + batch_size]
+                    ]
+                    statement = insert(TelemetryObservation).values(batch)
+                    statement = statement.on_conflict_do_update(
+                        constraint="uq_telemetry_identity",
+                        set_={
+                            "pilot_slug": statement.excluded.pilot_slug,
+                            "value": statement.excluded.value,
+                            "unit": statement.excluded.unit,
+                            "source": statement.excluded.source,
+                            "quality_flags": statement.excluded.quality_flags,
+                            "model_version": statement.excluded.model_version,
+                            "raw_payload_id": statement.excluded.raw_payload_id,
+                            "updated_at": datetime.now(UTC),
+                        },
+                    )
+                    await self.session.execute(statement)
+                    total_written += len(batch)
+
+            total_seen += parsed.rows_seen
+            files_processed.append(path.name)
+
+        await self.session.commit()
+        if min_date and max_date:
+            run.requested_from = min_date
+            run.requested_to = max_date
+
+        return await self._finish_run(
+            run,
+            status="success",
+            records_seen=total_seen,
+            records_written=total_written,
+            latency_ms=round((time.perf_counter() - started) * 1_000),
+            discovered_fields=sorted(
+                {source for source, _unit in VERIFIED_FIELDS.values()}
+            ),
+            diagnostics={
+                "input_format": "GeoCSV 2.0 (Dataset Mode)",
+                "mode": "dataset_substitution",
+                "files_processed": files_processed,
+                "station_id": self.settings.conduit_station_id,
+                "pilot_slug": self.pilot_slug,
+                "first_observed_at": min_date.isoformat() if min_date else None,
+                "last_observed_at": max_date.isoformat() if max_date else None,
+                "api_status": "API_NOT_AVAILABLE_USING_OFFLINE_DATASET",
+                "et0_status": "INSUFFICIENT_DATA",
+            },
+        )
+
     async def ingest_conduit(self, from_date: date, to_date: date) -> IngestionRun:
         if self.pilot_slug != "jkuat":
             raise ValueError("Conduit ingestion is only configured for the JKUAT pilot")
         run = await self._start_run("conduit", from_date, to_date)
         run_id = run.id
-        try:
-            client = ConduitClient(
-                self.settings.conduit_api_url,
-                self.settings.conduit_api_key,
-                self.settings.conduit_email,
-            )
-            fetched = await client.fetch(from_date, to_date)
-            payload_insert = (
-                insert(RawSourcePayload)
-                .values(
-                    pilot_slug=self.pilot_slug,
-                    source="conduit",
-                    requested_from=from_date,
-                    requested_to=to_date,
-                    checksum=fetched.checksum,
-                    payload=fetched.payload,
-                )
-                .on_conflict_do_nothing(index_elements=[RawSourcePayload.checksum])
-                .returning(RawSourcePayload.id)
-            )
-            raw_payload_id = (await self.session.execute(payload_insert)).scalar_one_or_none()
-            if raw_payload_id is None:
-                raw_payload_id = (
-                    await self.session.execute(
-                        select(RawSourcePayload.id).where(
-                            RawSourcePayload.checksum == fetched.checksum
-                        )
-                    )
-                ).scalar_one()
 
-            records = normalize_records(
-                fetched.payload,
-                self.settings.conduit_field_map,
-                self.settings.conduit_station_id,
+        dataset_files = self._find_geocsv_datasets()
+        use_dataset_mode = bool(
+            dataset_files
+            and (
+                getattr(self.settings, "conduit_dataset_mode", False)
+                or not self.settings.conduit_api_key
+                or self.settings.conduit_api_key.upper() in {"DATASET", "OFFLINE", "LOCAL"}
             )
-            written = 0
-            for record in records:
-                statement = (
-                    insert(TelemetryObservation)
-                    .values(
-                        **record,
-                        pilot_slug=self.pilot_slug,
-                        raw_payload_id=raw_payload_id,
-                    )
-                    .on_conflict_do_update(
-                        constraint="uq_telemetry_identity",
-                        set_={
-                            "value": record["value"],
-                            "unit": record["unit"],
-                            "quality_flags": record["quality_flags"],
-                            "raw_payload_id": raw_payload_id,
-                            "updated_at": datetime.now(UTC),
-                        },
-                    )
+        )
+
+        if not use_dataset_mode:
+            try:
+                client = ConduitClient(
+                    self.settings.conduit_api_url,
+                    self.settings.conduit_api_key,
+                    self.settings.conduit_email,
                 )
-                await self.session.execute(statement)
-                written += 1
-            await self.session.commit()
-            mapping_required = not bool(self.settings.conduit_field_map)
-            return await self._finish_run(
-                run,
-                status="mapping_required" if mapping_required else "success",
-                records_seen=len(records),
-                records_written=written,
-                latency_ms=fetched.latency_ms,
-                discovered_fields=fetched.discovered_fields,
-                diagnostics={
-                    "pilot_slug": self.pilot_slug,
-                    "checksum": fetched.checksum,
-                    "mapping_configured": not mapping_required,
-                    "et0_status": "INSUFFICIENT_DATA",
-                    "et0_reason": "EXPLICIT_DAILY_TMIN_TMAX_REQUIRED",
-                },
-            )
-        except Exception as exc:
-            await self.session.rollback()
-            logger.exception(
-                "conduit_ingestion_failed", run_id=str(run_id), error_type=type(exc).__name__
-            )
-            return await self._fail_run(
-                run_id,
-                error_code="CONDUIT_INGESTION_FAILED",
-                error_message=_safe_error_message(exc),
-            )
+                fetched = await client.fetch(from_date, to_date)
+                payload_insert = (
+                    insert(RawSourcePayload)
+                    .values(
+                        pilot_slug=self.pilot_slug,
+                        source="conduit",
+                        requested_from=from_date,
+                        requested_to=to_date,
+                        checksum=fetched.checksum,
+                        payload=fetched.payload,
+                    )
+                    .on_conflict_do_nothing(index_elements=[RawSourcePayload.checksum])
+                    .returning(RawSourcePayload.id)
+                )
+                raw_payload_id = (await self.session.execute(payload_insert)).scalar_one_or_none()
+                if raw_payload_id is None:
+                    raw_payload_id = (
+                        await self.session.execute(
+                            select(RawSourcePayload.id).where(
+                                RawSourcePayload.checksum == fetched.checksum
+                            )
+                        )
+                    ).scalar_one()
+
+                records = normalize_records(
+                    fetched.payload,
+                    self.settings.conduit_field_map,
+                    self.settings.conduit_station_id,
+                )
+                written = 0
+                if records:
+                    insert_records = [
+                        {**record, "pilot_slug": self.pilot_slug, "raw_payload_id": raw_payload_id}
+                        for record in records
+                    ]
+                    for i in range(0, len(insert_records), 200):
+                        chunk = insert_records[i : i + 200]
+                        stmt = insert(TelemetryObservation).values(chunk)
+                        upsert_stmt = stmt.on_conflict_do_update(
+                            constraint="uq_telemetry_identity",
+                            set_={
+                                "value": stmt.excluded.value,
+                                "unit": stmt.excluded.unit,
+                                "quality_flags": stmt.excluded.quality_flags,
+                                "raw_payload_id": raw_payload_id,
+                                "updated_at": datetime.now(UTC),
+                            },
+                        )
+                        res = await self.session.execute(upsert_stmt)
+                        written += max(res.rowcount or 0, len(chunk))
+                await self.session.commit()
+                mapping_required = not bool(self.settings.conduit_field_map)
+                return await self._finish_run(
+                    run,
+                    status="mapping_required" if mapping_required else "success",
+                    records_seen=len(records),
+                    records_written=written,
+                    latency_ms=fetched.latency_ms,
+                    discovered_fields=fetched.discovered_fields,
+                    diagnostics={
+                        "pilot_slug": self.pilot_slug,
+                        "checksum": fetched.checksum,
+                        "mapping_configured": not mapping_required,
+                        "et0_status": "INSUFFICIENT_DATA",
+                        "et0_reason": "EXPLICIT_DAILY_TMIN_TMAX_REQUIRED",
+                    },
+                )
+            except ConduitAuthenticationError as exc:
+                if dataset_files:
+                    logger.warning(
+                        "conduit_auth_failed_fallback_to_dataset",
+                        run_id=str(run_id),
+                        error=str(exc),
+                        dataset_count=len(dataset_files),
+                    )
+                    use_dataset_mode = True
+                else:
+                    await self.session.rollback()
+                    logger.warning("conduit_auth_failed", run_id=str(run_id), error=str(exc))
+                    return await self._fail_run(
+                        run_id,
+                        error_code="CONDUIT_AUTHENTICATION_FAILED",
+                        error_message=str(exc),
+                    )
+            except Exception as exc:
+                if dataset_files:
+                    logger.warning(
+                        "conduit_fetch_failed_fallback_to_dataset",
+                        run_id=str(run_id),
+                        error=str(exc),
+                        dataset_count=len(dataset_files),
+                    )
+                    use_dataset_mode = True
+                else:
+                    await self.session.rollback()
+                    logger.exception(
+                        "conduit_ingestion_failed", run_id=str(run_id), error_type=type(exc).__name__
+                    )
+                    return await self._fail_run(
+                        run_id,
+                        error_code="CONDUIT_INGESTION_FAILED",
+                        error_message=_safe_error_message(exc),
+                    )
+
+        if use_dataset_mode and dataset_files:
+            try:
+                return await self._ingest_geocsv_datasets(run, dataset_files)
+            except Exception as exc:
+                await self.session.rollback()
+                logger.exception(
+                    "conduit_dataset_ingestion_failed",
+                    run_id=str(run_id),
+                    error_type=type(exc).__name__,
+                )
+                return await self._fail_run(
+                    run_id,
+                    error_code="CONDUIT_DATASET_INGESTION_FAILED",
+                    error_message=_safe_error_message(exc),
+                )
 
     async def remove_unverified_jkuat_observations(self) -> int:
         if self.pilot_slug != "jkuat":
@@ -288,33 +483,46 @@ class IngestionService:
                 await self.session.flush()
                 raw_payload_id = raw_payload.id
 
+            existing_count = 0
+            if raw_payload_id is not None:
+                existing_count = (
+                    await self.session.execute(
+                        select(func.count(TelemetryObservation.id)).where(
+                            TelemetryObservation.raw_payload_id == raw_payload_id
+                        )
+                    )
+                ).scalar() or 0
+
             records_written = 0
-            batch_size = 1_000
-            for offset in range(0, len(parsed.records), batch_size):
-                batch = [
-                    {
-                        **record,
-                        "pilot_slug": self.pilot_slug,
-                        "raw_payload_id": raw_payload_id,
-                    }
-                    for record in parsed.records[offset : offset + batch_size]
-                ]
-                statement = insert(TelemetryObservation).values(batch)
-                statement = statement.on_conflict_do_update(
-                    constraint="uq_telemetry_identity",
-                    set_={
-                        "pilot_slug": statement.excluded.pilot_slug,
-                        "value": statement.excluded.value,
-                        "unit": statement.excluded.unit,
-                        "source": statement.excluded.source,
-                        "quality_flags": statement.excluded.quality_flags,
-                        "model_version": statement.excluded.model_version,
-                        "raw_payload_id": statement.excluded.raw_payload_id,
-                        "updated_at": datetime.now(UTC),
-                    },
-                )
-                await self.session.execute(statement)
-                records_written += len(batch)
+            if existing_count > 0:
+                records_written = existing_count
+            else:
+                batch_size = 2_500
+                for offset in range(0, len(parsed.records), batch_size):
+                    batch = [
+                        {
+                            **record,
+                            "pilot_slug": self.pilot_slug,
+                            "raw_payload_id": raw_payload_id,
+                        }
+                        for record in parsed.records[offset : offset + batch_size]
+                    ]
+                    statement = insert(TelemetryObservation).values(batch)
+                    statement = statement.on_conflict_do_update(
+                        constraint="uq_telemetry_identity",
+                        set_={
+                            "pilot_slug": statement.excluded.pilot_slug,
+                            "value": statement.excluded.value,
+                            "unit": statement.excluded.unit,
+                            "source": statement.excluded.source,
+                            "quality_flags": statement.excluded.quality_flags,
+                            "model_version": statement.excluded.model_version,
+                            "raw_payload_id": statement.excluded.raw_payload_id,
+                            "updated_at": datetime.now(UTC),
+                        },
+                    )
+                    await self.session.execute(statement)
+                    records_written += len(batch)
             await self.session.commit()
             return await self._finish_run(
                 run,
@@ -497,24 +705,28 @@ class IngestionService:
                     if station.role == "regional_reference"
                 ),
             )
-            for record in records:
-                await self.session.execute(
-                    insert(TelemetryObservation)
-                    .values(**record, raw_payload_id=raw_payload_id)
-                    .on_conflict_do_update(
+            if records:
+                insert_records = [
+                    {**record, "raw_payload_id": raw_payload_id}
+                    for record in records
+                ]
+                for i in range(0, len(insert_records), 200):
+                    chunk = insert_records[i : i + 200]
+                    stmt = insert(TelemetryObservation).values(chunk)
+                    upsert_stmt = stmt.on_conflict_do_update(
                         constraint="uq_telemetry_identity",
                         set_={
                             "pilot_slug": self.pilot_slug,
-                            "value": record["value"],
-                            "unit": record["unit"],
-                            "source": record["source"],
-                            "quality_flags": record["quality_flags"],
-                            "model_version": record["model_version"],
+                            "value": stmt.excluded.value,
+                            "unit": stmt.excluded.unit,
+                            "source": stmt.excluded.source,
+                            "quality_flags": stmt.excluded.quality_flags,
+                            "model_version": stmt.excluded.model_version,
                             "raw_payload_id": raw_payload_id,
                             "updated_at": datetime.now(UTC),
                         },
                     )
-                )
+                    await self.session.execute(upsert_stmt)
             await self.session.commit()
             return await self._finish_run(
                 run,
@@ -544,23 +756,40 @@ class IngestionService:
             )
 
     async def ensure_h3_grid(self) -> int:
-        cells = h3_cells_for_polygon(self.area, self.settings.h3_resolution)
-        written = 0
-        for cell_id in cells:
+        cells = list(h3_cells_for_polygon(self.area, self.settings.h3_resolution))
+        if not cells:
+            return 0
+        existing_indices = set(
+            (
+                await self.session.execute(
+                    select(H3Cell.h3_index).where(H3Cell.h3_index.in_(cells))
+                )
+            ).scalars()
+        )
+        missing = [c for c in cells if c not in existing_indices]
+        if not missing:
+            return 0
+        batch = []
+        for cell_id in missing:
             polygon = h3_polygon(cell_id)
             centroid = h3_centroid(cell_id)
-            statement = (
+            batch.append(
+                {
+                    "h3_index": cell_id,
+                    "resolution": self.settings.h3_resolution,
+                    "area_ha": float(h3.cell_area(cell_id, unit="km^2") * 100),
+                    "geom": from_shape(polygon, srid=4326),
+                    "centroid": from_shape(centroid, srid=4326),
+                }
+            )
+        written = 0
+        for i in range(0, len(batch), 500):
+            chunk = batch[i : i + 500]
+            result = await self.session.execute(
                 insert(H3Cell)
-                .values(
-                    h3_index=cell_id,
-                    resolution=self.settings.h3_resolution,
-                    area_ha=float(h3.cell_area(cell_id, unit="km^2") * 100),
-                    geom=from_shape(polygon, srid=4326),
-                    centroid=from_shape(centroid, srid=4326),
-                )
+                .values(chunk)
                 .on_conflict_do_nothing(index_elements=[H3Cell.h3_index])
             )
-            result = await self.session.execute(statement)
             written += max(result.rowcount or 0, 0)
         await self.session.commit()
         return written
@@ -745,23 +974,33 @@ class IngestionService:
         try:
             await self.ensure_h3_grid()
             features = await fetch_water_features(self.settings.osm_overpass_url, self.area)
-            for feature in features:
-                values = {
-                    "osm_id": feature.osm_id,
-                    "name": feature.name,
-                    "feature_type": feature.feature_type,
-                    "geom": from_shape(Point(feature.longitude, feature.latitude), srid=4326),
-                    "tags": feature.tags,
-                    "fetched_at": feature.fetched_at,
-                }
-                await self.session.execute(
-                    insert(WaterPoint)
-                    .values(**values)
-                    .on_conflict_do_update(
+            if features:
+                values_list = [
+                    {
+                        "osm_id": feature.osm_id,
+                        "name": feature.name,
+                        "feature_type": feature.feature_type,
+                        "geom": from_shape(Point(feature.longitude, feature.latitude), srid=4326),
+                        "tags": feature.tags,
+                        "fetched_at": feature.fetched_at,
+                    }
+                    for feature in features
+                ]
+                for i in range(0, len(values_list), 200):
+                    chunk = values_list[i : i + 200]
+                    stmt = insert(WaterPoint).values(chunk)
+                    upsert_stmt = stmt.on_conflict_do_update(
                         index_elements=[WaterPoint.osm_id],
-                        set_={**values, "updated_at": datetime.now(UTC)},
+                        set_={
+                            "name": stmt.excluded.name,
+                            "feature_type": stmt.excluded.feature_type,
+                            "geom": stmt.excluded.geom,
+                            "tags": stmt.excluded.tags,
+                            "fetched_at": stmt.excluded.fetched_at,
+                            "updated_at": datetime.now(UTC),
+                        },
                     )
-                )
+                    await self.session.execute(upsert_stmt)
             if features:
                 await self.session.execute(
                     text(

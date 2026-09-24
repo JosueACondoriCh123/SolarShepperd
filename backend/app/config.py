@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     conduit_email: str = ""
     conduit_field_map_json: str = "{}"
     conduit_station_id: str = "jkuat-conduit"
+    conduit_dataset_mode: bool = False
+    conduit_data_dir: str = "data"
 
     pilot_name: str = "JKUAT"
     pilot_lat: float = -1.1018

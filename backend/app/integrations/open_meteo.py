@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import time
@@ -101,10 +102,18 @@ class OpenMeteoClient:
             "wind_speed_unit": "ms",
             "models": "best_match",
         }
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            response = await client.get(self.api_url, params=params)
-            response.raise_for_status()
-            payload = response.json()
+        payload = None
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                    response = await client.get(self.api_url, params=params)
+                    response.raise_for_status()
+                    payload = response.json()
+                break
+            except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError):
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(1.0)
         if not isinstance(payload, dict):
             raise ValueError("Open-Meteo response must be a JSON object")
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)

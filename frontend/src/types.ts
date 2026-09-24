@@ -127,6 +127,7 @@ export interface CellProperties {
   to_value?: number | null;
   from_scene_id?: string;
   to_scene_id?: string;
+  biomass_calibrated?: boolean;
 }
 
 export interface CellFeature {
@@ -155,12 +156,73 @@ export interface RouteResponse {
   profile: "fastest" | "resource_aware";
 }
 
+export interface ActiveCalibrationModel {
+  id: string;
+  version: string;
+  algorithm: string;
+  coefficients: { slope?: number; intercept?: number; [key: string]: unknown };
+  metrics: {
+    r2: number;
+    rmse: number;
+    mae: number;
+    n_samples: number;
+    min_ndvi?: number;
+    max_ndvi?: number;
+    min_dm?: number;
+    max_dm?: number;
+  };
+  activated_at?: string | null;
+  notes?: string | null;
+}
+
 export interface CalibrationStatus {
   status: "CALIBRATION_REQUIRED" | "READY";
   sample_count: number;
   active_model_version: string | null;
+  active_model?: ActiveCalibrationModel | null;
+  candidate_count?: number;
+  matched_sample_count?: number;
   required_fields: string[];
   message: string;
+}
+
+export interface CalibrationModelSummary {
+  id: string;
+  pilot_slug: string;
+  kind: string;
+  version: string;
+  algorithm: string;
+  status: "candidate" | "active" | "deprecated" | "rejected";
+  coefficients: { slope?: number; intercept?: number; [key: string]: unknown };
+  metrics: {
+    r2: number;
+    rmse: number;
+    mae: number;
+    n_samples: number;
+    min_ndvi?: number;
+    max_ndvi?: number;
+    min_dm?: number;
+    max_dm?: number;
+    [key: string]: unknown;
+  };
+  training_sample_ids: string[];
+  notes?: string | null;
+  activated_at?: string | null;
+  created_at: string;
+}
+
+export interface GchCalculationResult {
+  pilot_slug: string;
+  model_version: string;
+  herd_tlu: number;
+  utilization_factor: number;
+  total_biomass_kg_dm: number;
+  usable_forage_kg_dm: number;
+  daily_consumption_kg_dm: number;
+  grazing_horizon_days: number;
+  cell_count: number;
+  mean_biomass_kg_ha: number;
+  calculated_at: string;
 }
 
 export interface IngestionRun {

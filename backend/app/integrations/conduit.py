@@ -19,6 +19,10 @@ class ConduitResponseError(RuntimeError):
     pass
 
 
+class ConduitAuthenticationError(ConduitResponseError):
+    pass
+
+
 @dataclass(frozen=True)
 class ConduitFetchResult:
     payload: dict[str, Any] | list[Any]
@@ -55,8 +59,8 @@ class ConduitClient:
                 "CONDUIT_API_KEY and CONDUIT_EMAIL must both be configured"
             )
         self.url = url
-        self.api_key = api_key
-        self.email = email
+        self.api_key = api_key.strip()
+        self.email = email.strip()
         self.timeout_s = timeout_s
 
     async def fetch(self, from_date: date, to_date: date) -> ConduitFetchResult:
@@ -73,11 +77,21 @@ class ConduitClient:
                 headers={"Accept": "application/json", "User-Agent": "SolarShepherd/0.1"},
             )
         latency_ms = round((time.perf_counter() - started) * 1_000)
+        if response.status_code == 401:
+            try:
+                err_data = response.json()
+                msg = err_data.get("message", "Wrong Email or APIKey")
+            except Exception:
+                msg = "Unauthorized"
+            raise ConduitAuthenticationError(f"Conduit authentication failed: {msg}")
         response.raise_for_status()
         try:
             payload = response.json()
         except ValueError as exc:
             raise ConduitResponseError("Conduit returned a non-JSON response") from exc
+        if isinstance(payload, dict) and payload.get("status") == "error":
+            msg = payload.get("message") or "Unknown Conduit API error"
+            raise ConduitResponseError(f"Conduit API error: {msg}")
         if not isinstance(payload, (dict, list)):
             raise ConduitResponseError("Conduit JSON must be an object or an array")
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)

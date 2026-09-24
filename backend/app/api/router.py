@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import socket
+import time
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from urllib.parse import urlparse
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Query, Response, UploadFile
@@ -38,6 +41,11 @@ from app.models import (
     SystemState,
     TelemetryObservation,
 )
+from app.operational_schemas import (
+    GchCalculationRequest,
+    ModelActivateRequest,
+    ModelFitRequest,
+)
 from app.pilots import PILOTS, PilotDefinition, get_pilot
 from app.schemas import (
     CalibrationStatus,
@@ -49,7 +57,15 @@ from app.schemas import (
     RouteResponse,
     TelemetryResponse,
 )
-from app.services.calibration import sample_template, validate_sample_csv
+from app.services.calibration import (
+    activate_model_version,
+    calculate_grazing_capacity,
+    fit_candidate_model,
+    match_samples_with_satellite_data,
+    sample_template,
+    validate_sample_csv,
+)
+from app.services.ingestion import IngestionService
 from app.services.routing import RoutingService
 from app.tasks.jobs import dispatch_ingestion
 
@@ -57,6 +73,27 @@ router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_api_access)])
 SessionDependency = Annotated[AsyncSession, Depends(get_session)]
 SettingsDependency = Annotated[Settings, Depends(get_settings)]
 GEOD = Geod(ellps="WGS84")
+
+_redis_last_check: float = 0.0
+_redis_is_available: bool = False
+
+
+def is_redis_available(redis_url: str, cache_ttl: float = 15.0) -> bool:
+    global _redis_last_check, _redis_is_available
+    now = time.monotonic()
+    if now - _redis_last_check < cache_ttl:
+        return _redis_is_available
+    _redis_last_check = now
+    try:
+        parsed = urlparse(redis_url)
+        host = parsed.hostname or "localhost"
+        port = parsed.port or 6379
+        with socket.create_connection((host, port), timeout=0.2):
+            _redis_is_available = True
+            return True
+    except Exception:
+        _redis_is_available = False
+        return False
 
 
 def _require_pilot(slug: str | None) -> PilotDefinition:
@@ -421,7 +458,7 @@ async def scenes(
 async def cells(
     session: SessionDependency,
     bbox: str = Query(description="minLon,minLat,maxLon,maxLat"),
-    layer: Literal["ndvi", "ndmi", "elevation", "slope", "forage_proxy"] = "ndvi",
+    layer: Literal["ndvi", "ndmi", "elevation", "slope", "forage_proxy", "biomass"] = "ndvi",
     observed_date: date | None = Query(default=None, alias="date"),
     limit: int = Query(default=8_000, ge=1, le=10_000),
     pilot: str = Query(default="jkuat"),
@@ -435,6 +472,20 @@ async def cells(
         ) from None
     if not (-180 <= min_lon < max_lon <= 180 and -90 <= min_lat < max_lat <= 90):
         raise APIError("INVALID_BBOX", "bbox coordinates are outside valid bounds", status_code=422)
+
+    active_model = (
+        await session.execute(
+            select(ModelVersion)
+            .where(
+                ModelVersion.pilot_slug == pilot_definition.slug,
+                ModelVersion.kind == "dry_matter",
+                ModelVersion.status == "active",
+            )
+            .order_by(ModelVersion.activated_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
     query = text(
         """
         SELECT c.h3_index,
@@ -500,6 +551,13 @@ async def cells(
         if layer == "forage_proxy":
             value = None if row["ndvi"] is None else max(0.0, min(1.0, (row["ndvi"] + 1) / 2))
             return value, "relative index", "Sentinel-2 NDVI proxy"
+        if layer == "biomass":
+            if active_model and row["ndvi"] is not None:
+                slope = float(active_model.coefficients.get("slope", 0))
+                intercept = float(active_model.coefficients.get("intercept", 0))
+                val = max(0.0, slope * float(row["ndvi"]) + intercept)
+                return round(val, 1), "kg DM/ha", f"Calibrated {active_model.version}"
+            return None, "kg DM/ha", "CALIBRATION_REQUIRED"
         return row[layer], "index", "Sentinel-2 L2A"
 
     features = []
@@ -508,6 +566,8 @@ async def cells(
         quality_flags = list(row["quality_flags"] or [])
         if layer == "forage_proxy" and value is not None:
             quality_flags.append("RELATIVE_PROXY_NOT_BIOMASS")
+        if layer == "biomass" and not active_model:
+            quality_flags.append("CALIBRATION_REQUIRED")
         features.append(
             {
                 "type": "Feature",
@@ -531,7 +591,12 @@ async def cells(
     return {
         "type": "FeatureCollection",
         "features": features,
-        "meta": {"layer": layer, "count": len(features), "biomass_calibrated": False},
+        "meta": {
+            "layer": layer,
+            "count": len(features),
+            "biomass_calibrated": active_model is not None,
+            "active_model_version": active_model.version if active_model else None,
+        },
     }
 
 
@@ -711,11 +776,38 @@ async def cell_detail(
     )
     if row is None:
         raise APIError("CELL_NOT_FOUND", "The requested H3 cell is not available.", status_code=404)
+
+    active_model = (
+        await session.execute(
+            select(ModelVersion)
+            .where(
+                ModelVersion.pilot_slug == pilot_definition.slug,
+                ModelVersion.kind == "dry_matter",
+                ModelVersion.status == "active",
+            )
+            .order_by(ModelVersion.activated_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+    biomass = None
+    if active_model and row["ndvi"] is not None:
+        slope = float(active_model.coefficients.get("slope", 0))
+        intercept = float(active_model.coefficients.get("intercept", 0))
+        biomass = max(0.0, slope * float(row["ndvi"]) + intercept)
+
+    area_ha = float(row["area_ha"] or 0.5)
+    gch_days = (
+        round((biomass * area_ha * 0.40) / (10 * 6.25), 1)
+        if biomass is not None
+        else None
+    )
+
     return {
         **dict(row),
-        "biomass_kg_dm_ha": None,
-        "gch_days": None,
-        "capacity_status": "CALIBRATION_REQUIRED",
+        "biomass_kg_dm_ha": round(biomass, 1) if biomass is not None else None,
+        "gch_days": gch_days,
+        "capacity_status": "READY" if active_model else "CALIBRATION_REQUIRED",
     }
 
 
@@ -879,16 +971,54 @@ async def calibration_status(
     active_model = (
         await session.execute(
             select(ModelVersion)
-            .where(ModelVersion.kind == "dry_matter", ModelVersion.status == "active")
+            .where(
+                ModelVersion.pilot_slug == pilot_definition.slug,
+                ModelVersion.kind == "dry_matter",
+                ModelVersion.status == "active",
+            )
             .order_by(ModelVersion.activated_at.desc())
             .limit(1)
         )
     ).scalar_one_or_none()
+
+    candidates = (
+        await session.scalar(
+            select(func.count(ModelVersion.id)).where(
+                ModelVersion.pilot_slug == pilot_definition.slug,
+                ModelVersion.kind == "dry_matter",
+                ModelVersion.status == "candidate",
+            )
+        )
+        or 0
+    )
+
+    matched_samples = await match_samples_with_satellite_data(session, pilot_definition.slug)
+    matched_count = sum(1 for m in matched_samples if m["is_matched"])
     ready = active_model is not None
+
+    active_detail = (
+        {
+            "id": str(active_model.id),
+            "version": active_model.version,
+            "algorithm": active_model.algorithm,
+            "coefficients": active_model.coefficients,
+            "metrics": active_model.metrics,
+            "activated_at": active_model.activated_at.isoformat()
+            if active_model.activated_at
+            else None,
+            "notes": active_model.notes,
+        }
+        if active_model
+        else None
+    )
+
     return CalibrationStatus(
         status="READY" if ready else "CALIBRATION_REQUIRED",
         sample_count=sample_count,
         active_model_version=active_model.version if active_model else None,
+        active_model=active_detail,
+        candidate_count=candidates,
+        matched_sample_count=matched_count,
         required_fields=[
             "sample_id",
             "sampled_at_with_timezone",
@@ -899,13 +1029,165 @@ async def calibration_status(
             "quadrat_area_m2",
         ],
         message=(
-            "A validated local dry-matter model is active."
+            f"Validated local dry-matter model ({active_model.version}) is active."
             if ready
             else (
                 "Biomass and grazing capacity remain locked until local field "
                 "samples are validated."
             )
         ),
+    )
+
+
+@router.get("/calibration/matched-samples")
+async def calibration_matched_samples(
+    session: SessionDependency, pilot: str = Query(default="jkuat")
+) -> dict[str, Any]:
+    pilot_definition = _require_pilot(pilot)
+    matched = await match_samples_with_satellite_data(session, pilot_definition.slug)
+    return {"data": matched, "count": len(matched)}
+
+
+@router.get("/calibration/models")
+async def list_calibration_models(
+    session: SessionDependency, pilot: str = Query(default="jkuat")
+) -> dict[str, Any]:
+    pilot_definition = _require_pilot(pilot)
+    models = list(
+        (
+            await session.execute(
+                select(ModelVersion)
+                .where(
+                    ModelVersion.pilot_slug == pilot_definition.slug,
+                    ModelVersion.kind == "dry_matter",
+                )
+                .order_by(ModelVersion.created_at.desc())
+            )
+        ).scalars()
+    )
+    data = [
+        {
+            "id": str(m.id),
+            "pilot_slug": m.pilot_slug,
+            "kind": m.kind,
+            "version": m.version,
+            "algorithm": m.algorithm,
+            "status": m.status,
+            "coefficients": m.coefficients,
+            "metrics": m.metrics,
+            "training_sample_ids": m.training_sample_ids or [],
+            "notes": m.notes,
+            "activated_at": m.activated_at.isoformat() if m.activated_at else None,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+        }
+        for m in models
+    ]
+    return {"data": data, "count": len(data)}
+
+
+@router.get("/calibration/models/{model_id}")
+async def get_calibration_model(
+    model_id: UUID,
+    session: SessionDependency,
+    pilot: str = Query(default="jkuat"),
+) -> dict[str, Any]:
+    pilot_definition = _require_pilot(pilot)
+    model = await session.get(ModelVersion, model_id)
+    if not model or model.pilot_slug != pilot_definition.slug:
+        raise APIError("MODEL_NOT_FOUND", "Calibration model not found.", status_code=404)
+    return {
+        "id": str(model.id),
+        "pilot_slug": model.pilot_slug,
+        "kind": model.kind,
+        "version": model.version,
+        "algorithm": model.algorithm,
+        "status": model.status,
+        "coefficients": model.coefficients,
+        "metrics": model.metrics,
+        "training_sample_ids": model.training_sample_ids or [],
+        "notes": model.notes,
+        "activated_at": model.activated_at.isoformat() if model.activated_at else None,
+        "created_at": model.created_at.isoformat() if model.created_at else None,
+    }
+
+
+@router.post("/calibration/models/fit")
+async def fit_calibration_model_endpoint(
+    request: ModelFitRequest,
+    session: SessionDependency,
+    principal: PrincipalDependency,
+    pilot: str = Query(default="jkuat"),
+) -> dict[str, Any]:
+    pilot_definition = _require_pilot(pilot)
+    model = await fit_candidate_model(
+        session=session,
+        pilot_slug=pilot_definition.slug,
+        algorithm=request.algorithm,
+        sample_ids=request.sample_ids,
+        notes=request.notes,
+        user_id=principal.user_id if not principal.is_guest else None,
+    )
+    return {
+        "id": str(model.id),
+        "pilot_slug": model.pilot_slug,
+        "kind": model.kind,
+        "version": model.version,
+        "algorithm": model.algorithm,
+        "status": model.status,
+        "coefficients": model.coefficients,
+        "metrics": model.metrics,
+        "training_sample_ids": model.training_sample_ids or [],
+        "notes": model.notes,
+        "activated_at": model.activated_at.isoformat() if model.activated_at else None,
+        "created_at": model.created_at.isoformat() if model.created_at else None,
+    }
+
+
+@router.post("/calibration/models/{model_id}/activate")
+async def activate_calibration_model_endpoint(
+    model_id: UUID,
+    request: ModelActivateRequest,
+    session: SessionDependency,
+    owner: OwnerDependency,
+    pilot: str = Query(default="jkuat"),
+) -> dict[str, Any]:
+    pilot_definition = _require_pilot(pilot)
+    model = await activate_model_version(
+        session=session,
+        model_id=model_id,
+        user_id=owner.auth_user_id,
+        pilot_slug=pilot_definition.slug,
+        notes=request.notes,
+    )
+    return {
+        "id": str(model.id),
+        "pilot_slug": model.pilot_slug,
+        "kind": model.kind,
+        "version": model.version,
+        "algorithm": model.algorithm,
+        "status": model.status,
+        "coefficients": model.coefficients,
+        "metrics": model.metrics,
+        "training_sample_ids": model.training_sample_ids or [],
+        "notes": model.notes,
+        "activated_at": model.activated_at.isoformat() if model.activated_at else None,
+        "created_at": model.created_at.isoformat() if model.created_at else None,
+    }
+
+
+@router.post("/calibration/gch/calculate")
+async def calculate_gch_endpoint(
+    request: GchCalculationRequest,
+    session: SessionDependency,
+    pilot: str = Query(default="jkuat"),
+) -> dict[str, Any]:
+    pilot_definition = _require_pilot(pilot)
+    return await calculate_grazing_capacity(
+        session=session,
+        pilot_slug=pilot_definition.slug,
+        herd_tlu=request.herd_tlu,
+        utilization_factor=request.utilization_factor,
+        selected_cell_ids=request.selected_cell_ids,
     )
 
 
@@ -1269,9 +1551,12 @@ async def run_ingestion(
         "conduit", "aviation_weather", "satellite", "terrain", "osm", "forecast"
     ],
     _: Annotated[None, Depends(verify_admin_token)],
+    session: SessionDependency,
+    settings: SettingsDependency,
     from_date: date | None = None,
     to_date: date | None = None,
     pilot: str = Query(default="jkuat"),
+    mode: Literal["auto", "sync", "async"] = Query(default="auto"),
 ) -> dict[str, Any]:
     pilot_definition = _require_pilot(pilot)
     if source == "conduit" and pilot_definition.slug != "jkuat":
@@ -1281,15 +1566,53 @@ async def run_ingestion(
             status_code=422,
         )
     today = datetime.now(UTC).date()
-    task = dispatch_ingestion(
-        source,
-        (from_date or today - timedelta(days=1)).isoformat(),
-        (to_date or today).isoformat(),
-        pilot_definition.slug,
-    )
+    from_d = from_date or today - timedelta(days=1)
+    to_d = to_date or today
+
+    if mode == "async" or (mode == "auto" and is_redis_available(settings.redis_url)):
+        try:
+            task = dispatch_ingestion(
+                source,
+                from_d.isoformat(),
+                to_d.isoformat(),
+                pilot_definition.slug,
+            )
+            return {
+                "status": "accepted",
+                "source": source,
+                "pilot_slug": pilot_definition.slug,
+                "task_id": task.id,
+                "mode": "queued",
+            }
+        except Exception:
+            if mode == "async":
+                raise
+            # In auto mode, fallback to direct execution if Celery/Redis is unreachable
+
+    service = IngestionService(session, settings, pilot_definition.slug)
+    if source == "conduit":
+        run = await service.ingest_conduit(from_d, to_d)
+    elif source == "satellite":
+        run = await service.ingest_satellite()
+    elif source == "terrain":
+        run = await service.ingest_terrain()
+    elif source == "osm":
+        run = await service.ingest_osm()
+    elif source == "forecast":
+        run = await service.ingest_forecast()
+    elif source == "aviation_weather":
+        run = await service.ingest_public_observations()
+    else:
+        raise APIError("UNSUPPORTED_SOURCE", f"Unknown source {source}", status_code=422)
+
     return {
-        "status": "accepted",
+        "status": run.status,
         "source": source,
         "pilot_slug": pilot_definition.slug,
-        "task_id": task.id,
+        "run_id": str(run.id),
+        "records_written": run.records_written,
+        "records_seen": run.records_seen,
+        "error_code": run.error_code,
+        "error_message": run.error_message,
+        "mode": "direct",
     }

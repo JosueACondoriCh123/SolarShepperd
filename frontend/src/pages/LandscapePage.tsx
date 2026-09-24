@@ -16,6 +16,7 @@ import type {
 const layerOptions = [
   { value: "ndvi", label: "NDVI", detail: "Vegetation vigor" },
   { value: "ndmi", label: "NDMI", detail: "Canopy moisture" },
+  { value: "biomass", label: "Biomass", detail: "Calibrated kg DM/ha" },
   { value: "delta_ndvi", label: "ΔNDVI", detail: "Change between scenes" },
   { value: "delta_ndmi", label: "ΔNDMI", detail: "Moisture change" },
   { value: "forage_proxy", label: "Forage proxy", detail: "Relative, not biomass" },
@@ -69,7 +70,7 @@ export function LandscapePage() {
   );
   const latestScene = scenes.data?.data[0];
   const selectedLayer = layerOptions.find((item) => item.value === layer);
-  const requiresScene = ["ndvi", "ndmi", "forage_proxy"].includes(layer) || isChange;
+  const requiresScene = ["ndvi", "ndmi", "biomass", "forage_proxy"].includes(layer) || isChange;
   const coverageInsufficient = Boolean(
     cells.data?.features.length
     && cells.data.features.every((feature) => feature.properties.value == null)
@@ -133,7 +134,14 @@ export function LandscapePage() {
               {isChange && <div className="change-values"><div><span>Earlier</span><strong>{selected.properties.from_value?.toFixed(3) ?? "—"}</strong></div><div><span>Later</span><strong>{selected.properties.to_value?.toFixed(3) ?? "—"}</strong></div></div>}
               <dl className="inspection-list"><div><dt>Cell area</dt><dd>{selected.properties.area_ha.toFixed(1)} ha</dd></div><div><dt>Valid pixels</dt><dd>{selected.properties.valid_fraction == null ? "—" : `${(selected.properties.valid_fraction * 100).toFixed(0)}%`}</dd></div><div><dt>Acquired</dt><dd>{selected.properties.observed_at ? new Date(selected.properties.observed_at).toLocaleDateString() : "—"}</dd></div><div><dt>Source</dt><dd>{selected.properties.source || "—"}</dd></div><div><dt>Model</dt><dd>{selected.properties.model_version || "not applicable"}</dd></div></dl>
               {selected.properties.quality_flags.length > 0 && <div className="quality-list"><strong>Quality</strong>{selected.properties.quality_flags.map((flag) => <span key={flag}>{flag}</span>)}</div>}
-              <div className="calibration-warning"><strong>Biomass locked</strong><p>Index values and changes are not kilograms of dry matter.</p></div>
+              {selected.properties.biomass_calibrated ? (
+                <div className="calibration-notice success">
+                  <strong>Biomass Calibrated</strong>
+                  <p>Model {selected.properties.model_version || "Active"}: {selected.properties.value == null ? "—" : selected.properties.value.toFixed(1)} kg DM/ha</p>
+                </div>
+              ) : (
+                <div className="calibration-warning"><strong>Biomass locked</strong><p>Index values and changes are not kilograms of dry matter.</p></div>
+              )}
             </>
           ) : (
             <div className="zone-evidence">

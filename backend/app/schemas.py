@@ -87,6 +87,9 @@ class CalibrationStatus(BaseModel):
     active_model_version: str | None
     required_fields: list[str]
     message: str
+    active_model: dict[str, Any] | None = None
+    candidate_count: int = 0
+    matched_sample_count: int = 0
 
 
 class IngestionRunResponse(BaseModel):

@@ -595,12 +595,21 @@ class ModelVersion(Base, TimestampMixin):
     __tablename__ = "model_versions"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    pilot_slug: Mapped[str] = mapped_column(
+        String(32), ForeignKey("pilots.slug", ondelete="CASCADE"), default="jkuat", index=True
+    )
     kind: Mapped[str] = mapped_column(String(64), index=True)
     version: Mapped[str] = mapped_column(String(64))
+    algorithm: Mapped[str] = mapped_column(String(64), default="linear_ndvi")
     status: Mapped[str] = mapped_column(String(32), default="candidate")
     coefficients: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     metrics: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    training_sample_ids: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    notes: Mapped[str | None] = mapped_column(Text)
     activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    activated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user_profiles.auth_user_id", ondelete="SET NULL")
+    )
 
 
 class SystemState(Base):

@@ -29,6 +29,10 @@ function colorForValue(value: number | null, layer: string): [number, number, nu
       ? [220, Math.round(190 - 115 * magnitude), 64, 205]
       : [Math.round(226 - 150 * magnitude), Math.round(190 + 35 * magnitude), 92, 205];
   }
+  if (layer === "biomass") {
+    const t = Math.max(0, Math.min(1, value / 2500));
+    return [Math.round(212 * (1 - t) + 45 * t), Math.round(176 * (1 - t) + 122 * t), Math.round(94 * (1 - t) + 70 * t), 195];
+  }
   if (layer === "slope") {
     const t = Math.max(0, Math.min(1, value / 25));
     return [Math.round(235 * t + 45), Math.round(175 * (1 - t) + 70), 67, 185];

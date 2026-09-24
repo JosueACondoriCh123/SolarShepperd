@@ -168,3 +168,49 @@ class DataSourcePatch(BaseModel):
     schedule: str | None = Field(default=None, max_length=96)
     mapping: dict[str, Any] | None = None
 
+
+class ModelFitRequest(BaseModel):
+    algorithm: Literal["linear_ndvi", "power_law"] = "linear_ndvi"
+    notes: str | None = Field(default=None, max_length=500)
+    sample_ids: list[str] | None = None
+
+
+class ModelActivateRequest(BaseModel):
+    notes: str | None = Field(default=None, max_length=500)
+
+
+class CalibrationModelVersionDetail(BaseModel):
+    id: UUID
+    pilot_slug: str
+    kind: str
+    version: str
+    algorithm: str
+    status: str
+    coefficients: dict[str, Any]
+    metrics: dict[str, Any]
+    training_sample_ids: list[str]
+    notes: str | None
+    activated_at: datetime | None
+    created_at: datetime
+
+
+class GchCalculationRequest(BaseModel):
+    herd_tlu: float = Field(..., gt=0)
+    utilization_factor: float = Field(default=0.40, ge=0.05, le=0.80)
+    selected_cell_ids: list[str] | None = None
+
+
+class GchCalculationResult(BaseModel):
+    pilot_slug: str
+    model_version: str
+    herd_tlu: float
+    utilization_factor: float
+    total_biomass_kg_dm: float
+    usable_forage_kg_dm: float
+    daily_consumption_kg_dm: float
+    grazing_horizon_days: float
+    cell_count: int
+    mean_biomass_kg_ha: float
+    calculated_at: datetime
+
+

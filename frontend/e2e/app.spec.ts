@@ -215,6 +215,14 @@ async function mockOperationalApi(page: Page) {
       });
       return;
     }
+    if (path.endsWith("/calibration/models")) {
+      await route.fulfill({ json: { models: [], active_model: null } });
+      return;
+    }
+    if (path.endsWith("/calibration/matched-samples")) {
+      await route.fulfill({ json: { matched_samples: [], total_matched: 0, total_samples: 0 } });
+      return;
+    }
     if (path.endsWith("/telemetry")) {
       await route.fulfill({ json: { data: [{ metric: "temperature_c", value: 24.8, unit: "°C", observed_at: "2026-09-19T09:00:00Z", source: "conduit", quality_flags: [], model_version: null, station_id: "jkuat-conduit", depth_cm: null }], count: 1, from_time: "2026-09-18T00:00:00Z", to_time: "2026-09-19T00:00:00Z" } });
       return;
@@ -389,5 +397,84 @@ test("navigates response center and views episode detail", async ({ page }) => {
   await expect(page.getByRole("heading", { level: 1, name: "Response: High Temperature Critical" })).toBeVisible();
   await expect(page.getByRole("button", { name: /Acknowledge Alert & Evidence/i })).toBeVisible();
 });
+
+test("navigates calibration gate, displays progress stepper, and calculates grazing capacity when calibrated", async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("solarshepherd-dev-role", "member"));
+
+  await page.route("**/api/v1/calibration/status*", async (route) => {
+    await route.fulfill({
+      json: {
+        status: "READY",
+        sample_count: 12,
+        active_model_version: "cal-ols-v1",
+        active_model: {
+          id: "mod-111",
+          version: "cal-ols-v1",
+          algorithm: "linear_ols",
+          coefficients: { slope: 2840.5, intercept: 120.0 },
+          metrics: { r2: 0.842, rmse: 210.5, mae: 165.2, n_samples: 12 },
+          activated_at: "2026-09-20T12:00:00Z",
+          notes: "Wet season validated cohort",
+        },
+        candidate_count: 0,
+        matched_sample_count: 12,
+        required_fields: ["sample_id", "sampled_at", "geometry", "dry_matter_kg_ha", "method", "quadrat_area_m2"],
+        message: "Calibration model active. Biomass and GCH unlocked.",
+      },
+    });
+  });
+
+  await page.route("**/api/v1/calibration/models*", async (route) => {
+    await route.fulfill({
+      json: {
+        models: [
+          {
+            id: "mod-111",
+            pilot_slug: "jkuat",
+            kind: "empirical_biomass",
+            version: "cal-ols-v1",
+            algorithm: "linear_ols",
+            status: "active",
+            coefficients: { slope: 2840.5, intercept: 120.0 },
+            metrics: { r2: 0.842, rmse: 210.5, mae: 165.2, n_samples: 12 },
+            training_sample_ids: ["s1", "s2", "s3"],
+            notes: "Wet season validated cohort",
+            activated_at: "2026-09-20T12:00:00Z",
+            created_at: "2026-09-20T10:00:00Z",
+          },
+        ],
+        active_model: null,
+      },
+    });
+  });
+
+  await page.route("**/api/v1/calibration/gch/calculate*", async (route) => {
+    await route.fulfill({
+      json: {
+        pilot_slug: "jkuat",
+        model_version: "cal-ols-v1",
+        herd_tlu: 250,
+        utilization_factor: 0.4,
+        total_biomass_kg_dm: 187500.0,
+        usable_forage_kg_dm: 75000.0,
+        daily_consumption_kg_dm: 1562.5,
+        grazing_horizon_days: 48.0,
+        cell_count: 120,
+        mean_biomass_kg_ha: 1250.0,
+        calculated_at: "2026-09-21T18:00:00Z",
+      },
+    });
+  });
+
+  await page.goto("/app/jkuat/capacity");
+  await expect(page.getByRole("heading", { level: 1, name: "Carrying capacity" })).toBeVisible();
+  await expect(page.getByText("Active Model: cal-ols-v1")).toBeVisible();
+  await expect(page.getByText("0.842").first()).toBeVisible();
+
+  await page.getByRole("button", { name: /Calculate Grazing Horizon/i }).click();
+  await expect(page.getByText("48 DAYS")).toBeVisible();
+  await expect(page.getByText("75,000 kg DM")).toBeVisible();
+});
+
 
 
