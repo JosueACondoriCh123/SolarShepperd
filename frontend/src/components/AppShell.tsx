@@ -101,6 +101,25 @@ export function AppShell({ children }: PropsWithChildren) {
           <div>
             <strong>{auth.isGuest ? "Guest explorer" : auth.profile?.display_name || "Field member"}</strong>
             <span>{auth.isOwner ? "System owner" : auth.isGuest ? "Read-only access" : "Member"}</span>
+            {auth.isDevelopment && auth.isGuest && (
+              <button
+                type="button"
+                onClick={() => auth.setDevRole("member")}
+                style={{
+                  display: "inline-block",
+                  marginTop: "4px",
+                  fontSize: "11px",
+                  padding: "2px 6px",
+                  background: "#2563eb",
+                  color: "#fff",
+                  borderRadius: "4px",
+                  border: "none",
+                  cursor: "pointer",
+                }}
+              >
+                Activar Operador (Ver todo)
+              </button>
+            )}
           </div>
           <button aria-label="Log out" onClick={() => void logout()}><LogOut size={16} /></button>
         </div>

@@ -11,6 +11,14 @@ export function LandingPage() {
   const navigate = useNavigate();
   const [captchaToken, setCaptchaToken] = useState<string>();
   const [error, setError] = useState("");
+
+  const enterConsole = () => {
+    if (auth.isDevelopment) {
+      auth.setDevRole("member");
+    }
+    navigate(`/app/${preferredPilotSlug()}/dashboard`);
+  };
+
   const enterGuest = async () => {
     setError("");
     try {
@@ -20,11 +28,23 @@ export function LandingPage() {
       setError(reason instanceof Error ? reason.message : "Guest access is temporarily unavailable.");
     }
   };
+
   return (
     <div className="marketing-shell">
       <header className="marketing-nav">
         <Link to="/" className="brand"><span className="brand-mark"><Hexagon size={25} /><i /></span><span><strong>SolarShepherd</strong><small>Evidence-led field intelligence</small></span></Link>
-        <nav><a href="#method">How it works</a><a href="#science">Science</a><Link to="/login">Log in</Link><Link className="button primary" to="/signup">Create account</Link></nav>
+        <nav>
+          <a href="#method">How it works</a>
+          <a href="#science">Science</a>
+          {auth.authenticated ? (
+            <Link className="button primary" to={`/app/${preferredPilotSlug()}/dashboard`}>Open console ({auth.isGuest ? "Guest" : "Operator"})</Link>
+          ) : (
+            <>
+              <Link to="/login">Log in</Link>
+              <Link className="button primary" to="/signup">Create account</Link>
+            </>
+          )}
+        </nav>
       </header>
 
       <main>
@@ -33,7 +53,16 @@ export function LandingPage() {
             <span className="kicker">THREE KENYA PILOTS · 10 KM EACH</span>
             <h1>Move livestock with evidence, not guesswork.</h1>
             <p>SolarShepherd combines real station telemetry, Earth observation, terrain and field samples into transparent routes and mission evidence.</p>
-            <div className="hero-actions"><Link className="button primary" to="/signup">Start field work <ArrowRight size={16} /></Link><button className="button secondary" disabled={turnstileConfigured && !captchaToken} onClick={enterGuest}>Explore as guest</button></div>
+            <div className="hero-actions">
+              <button className="button primary" onClick={enterConsole}>
+                Open field console <ArrowRight size={16} />
+              </button>
+              {(!auth.authenticated || auth.isGuest) && (
+                <button className="button secondary" disabled={turnstileConfigured && !captchaToken} onClick={enterGuest}>
+                  Explore as guest
+                </button>
+              )}
+            </div>
             <Turnstile onToken={setCaptchaToken} />
             {error && <p className="form-error">{error}</p>}
           </div>

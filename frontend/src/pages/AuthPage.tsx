@@ -55,6 +55,19 @@ export function AuthPage({ mode }: { mode: "login" | "signup" | "forgot" | "rese
       <Turnstile onToken={setCaptchaToken} />
       {error && <p className="form-error">{error}</p>}{message && <p className="form-success">{message}</p>}
       <button className="button primary wide" disabled={busy || (turnstileConfigured && !captchaToken)}>{busy ? "Working…" : title}</button>
+      {auth.isDevelopment && (
+        <button
+          type="button"
+          className="button secondary wide"
+          style={{ marginTop: "10px" }}
+          onClick={() => {
+            auth.setDevRole("member");
+            navigate(consolePath);
+          }}
+        >
+          Entrar como Operador / Administrador (Dev Mode)
+        </button>
+      )}
       <div className="auth-links">{mode === "login" && <><Link to="/forgot-password">Forgot password?</Link><Link to="/signup">Create account</Link></>}{mode !== "login" && <Link to="/login">Return to login</Link>}</div>
     </form>
   </AuthFrame>;

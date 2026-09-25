@@ -214,10 +214,10 @@ class RoutingService:
                         "ST_GeomFromText(:pilot_boundary, 4326))"
                     ),
                 )
+                .params(pilot_boundary=self.pilot.boundary.wkt)
                 .order_by(SatelliteScene.acquired_at.desc())
                 .limit(1)
-            ),
-            {"pilot_boundary": self.pilot.boundary.wkt},
+            )
         ).scalar_one_or_none()
         states = (
             await self.session.execute(

@@ -25,10 +25,12 @@ interface AuthValue {
   emailVerified: boolean;
   isGuest: boolean;
   isOwner: boolean;
+  isDevelopment: boolean;
   profile: UserProfile | null;
   signIn: (email: string, password: string, captchaToken?: string) => Promise<void>;
   signUp: (email: string, password: string, captchaToken?: string) => Promise<void>;
   exploreAsGuest: (captchaToken?: string) => Promise<void>;
+  setDevRole: (role: "none" | "guest" | "member") => void;
   requestPasswordReset: (email: string, captchaToken?: string) => Promise<void>;
   updatePassword: (password: string) => Promise<void>;
   signOut: () => Promise<void>;
@@ -41,9 +43,21 @@ export function AuthProvider({ children }: PropsWithChildren) {
   const [session, setSession] = useState<Session | null>(null);
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [loading, setLoading] = useState(true);
-  const [devRole, setDevRole] = useState<"none" | "guest" | "member">(
-    () => (localStorage.getItem("solarshepherd-dev-role") as "guest" | "member" | null) || "none",
-  );
+  const [devRole, setDevRoleState] = useState<"none" | "guest" | "member">(() => {
+    const stored = localStorage.getItem("solarshepherd-dev-role") as "guest" | "member" | "none" | null;
+    if (stored && stored !== "none") return stored;
+    if (authMode === "development" || !supabase) return "member";
+    return stored || "none";
+  });
+
+  const setDevRole = useCallback((role: "none" | "guest" | "member") => {
+    setDevRoleState(role);
+    if (role === "none") {
+      localStorage.removeItem("solarshepherd-dev-role");
+    } else {
+      localStorage.setItem("solarshepherd-dev-role", role);
+    }
+  }, []);
 
   const isDevelopment = devRole !== "none" || authMode === "development" || !supabase;
   const isGuest = isDevelopment
@@ -179,10 +193,12 @@ export function AuthProvider({ children }: PropsWithChildren) {
     emailVerified,
     isGuest,
     isOwner: Boolean(profile?.is_system_owner),
+    isDevelopment,
     profile,
     signIn,
     signUp,
     exploreAsGuest,
+    setDevRole,
     requestPasswordReset,
     updatePassword,
     signOut,
